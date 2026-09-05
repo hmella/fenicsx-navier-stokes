@@ -94,17 +94,23 @@ Regenerate the profile with `make profile STEPS=30 NP=8`; the `fxns_*` events an
 
 **Assembly, not the linear solver, is now the bottleneck.** Before the solver work it was the other way round: `KSPSolve` was 31% and two BoomerAMG hierarchies were rebuilt on every nonlinear iteration for another 13%. Anyone continuing this should start from `fxns_assemble_A`.
 
-**Measured effect of each change** (100 steps, production configuration, against the code at the commit before this work):
+**Measured effect** (100 steps, production configuration, against the commit before this work). Compare like windows: the first ten steps run 9, 7, 6, 4 nonlinear iterations while the flow starts from rest, so a mean over all 100 differs from the steady-state mean.
 
-| | s/step | s/nonlinear iteration |
-|---|---|---|
-| baseline | 8.01 | 4.01 |
-| solver options + preconditioner reuse | 4.45 | 2.22 |
-| plus quadrature degree 3 | see `make profile` | |
+| | all 100 steps | steps 10+ | s/nonlinear iteration |
+|---|---|---|---|
+| baseline | 8.96 | 8.02 | 4.02 |
+| new code, old AMG settings and no reuse | 5.11 | — | — |
+| new code | 3.45 | 3.05 | 1.53 |
 
-The Picard iteration histogram is unchanged (90 of 100 steps take exactly two iterations, in both).
+**2.6x either way**, and both configurations take exactly 2.00 nonlinear iterations per step from step 10 on, so the per-iteration figure is a clean comparison. Re-measured back to back on an idle machine, both numbers reproduce to better than 0.5%.
 
-**These changes do not alter the solution.** Verified by running both codes at `NonlinearTolerance: 1e-6` and `SolverATol: 1e-12` for 20 steps: every outlet flow, flow split, pressure and the divergence norm agree to **6.4e-6**, i.e. to the nonlinear tolerance. At the production `NonlinearTolerance: 1.0e-2` the same comparison shows up to **6%** difference in outlet pressures — that is the sensitivity of stopping the Picard iteration at a 1% relative change, not an effect of any of these changes, and it is worth knowing before treating two aorta runs as comparable.
+That middle row splits the credit: everything other than the AMG settings and preconditioner reuse (quadrature degree, nonzero initial guess, the assembly items) is worth 8.96 → 5.11, and the AMG settings plus reuse are worth a further 5.11 → 3.45. Note that the tuned AMG runs at *more* Krylov iterations, not fewer -- 11.7 against 9.3 per solve -- trading iteration count for a much cheaper setup and V-cycle.
+
+**These changes do not alter the solution.** Verified by running both codes at `NonlinearTolerance: 1e-6` and `SolverATol: 1e-12` for 20 steps: every outlet flow, flow split, pressure and the divergence norm agree to **6.4e-6**, i.e. to the nonlinear tolerance.
+
+**At the production `NonlinearTolerance: 1.0e-2` the same comparison shows up to 6% difference in outlet pressure, and that is not caused by any of this work.** The check that establishes it: take the *same* code and vary only settings that provably cannot change the converged answer -- preconditioner reuse off, AMG back to `strong_threshold 0.25` with Falgout and classical interpolation. Those two runs differ by **10.7%** in `P_out_6_mmHg`, more than the 6.0% between old code and new. Stopping the Picard iteration at a 1% relative change simply does not pin the outlet pressures better than about ten per cent during the start-up transient. Any A/B of the discretization has to be run at a tight nonlinear tolerance, and two aorta runs should not be treated as comparable at the percent level.
+
+**Nothing else got slower.** The tube3d verification case pays 0.6% for its tighter tolerances (20.29 s against 20.42 s over 25 steps) and gains a factor of 66 in the mass defect. The Turek 2D case uses the direct solver and is untouched, at 5.6 s for its 20-step smoke size. `make test` went from 60.5 s to 56.7 s.
 
 ### Things that were tried and did not work
 

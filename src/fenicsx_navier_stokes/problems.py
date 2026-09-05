@@ -1,14 +1,20 @@
 """
-Monolithic stabilized incompressible Navier-Stokes solver.
+Monolithic stabilized incompressible Navier-Stokes solvers.
 
 Momentum and mass are solved together as one saddle-point system per nonlinear iteration (no projection or fractional-step splitting):
 
-    rho*(3*u^{n+1} - 4*u^n + u^{n-1})/(2*dt) + rho*(u*.grad)u^{n+1}
+    rho*(3*u^{n+1} - 4*u^n + u^{n-1})/(2*dt) + rho*(u.grad)u^{n+1}
       - div(2*mu*eps(u^{n+1})) + grad(p^{n+1}) = f,      div(u^{n+1}) = 0
 
-Time stepping is BDF2 and the convection is linearized about the previous Picard iterate u* (an Oseen problem). Equal-order P1-P1 pairs are stabilized with SUPG/PSPG plus a grad-div term; P2-P1 is also available and is stabilized identically, the terms being consistent.
+Time stepping is BDF2. Two treatments of the nonlinearity are available:
 
-The 2x2 block system is a PETSc MatNest. The blocks that do not change during the Picard iteration are assembled once and added back with axpy each iteration; only the convection and stabilization blocks are re-assembled.
+  PicardNSProblem  linearizes the convection about the previous iterate (an Oseen problem). Converges linearly but from anywhere, including from rest.
+
+  NewtonNSProblem  solves the true nonlinear residual with its exact Jacobian. Converges quadratically but only from a good enough starting guess, which for a transient problem the previous time step supplies.
+
+Equal-order P1-P1 pairs are stabilized with SUPG/PSPG plus a grad-div term; P2-P1 is also available and is stabilized identically, the terms being consistent.
+
+The 2x2 block system is a PETSc MatNest. The blocks that do not change during the nonlinear iteration are assembled once and added back with axpy each iteration; only the convection and stabilization blocks are re-assembled.
 """
 
 import time
@@ -33,7 +39,18 @@ from dolfinx.fem.petsc import apply_lifting, assemble_matrix, assemble_vector, c
 from dolfinx.la.petsc import create_vector_wrap
 from mpi4py import MPI
 from petsc4py import PETSc
-from ufl import FacetNormal, Measure, TestFunction, TrialFunction, div, dot, grad, inner, nabla_grad
+from ufl import (
+    FacetNormal,
+    Measure,
+    TestFunction,
+    TrialFunction,
+    derivative,
+    div,
+    dot,
+    grad,
+    inner,
+    nabla_grad,
+)
 
 from .boundaries import backflow_stab, inlet_lap_paraboloid
 from .constitutive import eps
@@ -44,43 +61,42 @@ from .stabilization import tau_C, tau_M
 BDF2_THETA = 1.5
 
 
-# Configuration shared by every problem
+# Writes PETSc options under a per-instance prefix
+class _PrefixedOptions:
+    """
+    Maps opts["ksp_rtol"] onto the prefixed key PETSc actually reads, so the option-setting code below reads exactly as it did when it wrote into the global database.
+    """
+
+    def __init__(self, prefix):
+        self.prefix = prefix
+        self.db = PETSc.Options()
+
+    def __setitem__(self, key, value):
+        self.db[self.prefix + key] = value
+
+
+# Machinery shared by every problem
 class BaseProblem:
     """
-    Holds the objects a problem is built from: the parameter file, the mesh and its tags, the outlet models, the element pair and the output flags.
-    """
+    Everything that is not a variational form: the function spaces, the boundary conditions, the coefficients, the block matrices, the linear solver and the time loop.
 
-    def __init__(
-        self,
-        parameters=None,
-        mesh=None,
-        XDMF=True,
-        HDF5=False,
-        domains=None,
-        boundaries=None,
-        windkessels=None,
-        element="P2-P1",
-        ds_quad_deg=3,
-        dx_quad_deg=4,
-        inlet_plateau_lam=None,
-    ):
-        self.parameters = parameters
-        self.mesh = mesh
-        self.XDMF = XDMF
-        self.HDF5 = HDF5
-        self.domains = domains
-        self.boundaries = boundaries
-        self.windkessels = windkessels
-        self.element = element
-        self.ds_quad_deg = ds_quad_deg
-        self.dx_quad_deg = dx_quad_deg
-        self.inlet_plateau_lam = inlet_plateau_lam
+    Subclasses supply `set_problem()`, which builds their forms and then calls the helpers below, and `step()`, which advances one time step.
 
+    Arguments:
 
-# BDF2 / Picard stabilized Navier-Stokes problem
-class PicardNSProblem(BaseProblem):
-    """
-    Extra arguments beyond BaseProblem:
+      parameters - a ParameterHandler (or anything with the same Problem / Solver / Geometry layout).
+
+      mesh, domains, boundaries - the mesh and its cell and facet tags.
+
+      windkessels - sequence of Windkessel outlet models, or None.
+
+      element - 'P1-P1' (stabilized equal order) or 'P2-P1' (Taylor-Hood).
+
+      XDMF, HDF5 - output flags.
+
+      ds_quad_deg, dx_quad_deg - fallback quadrature degrees, used only when the parameter file omits them.
+
+      inlet_plateau_lam - length scale of the screened-Poisson inlet profile.
 
       f - body force (ufl expression or Function); None means no body force. Needed for manufactured-solution verification, not by the physical cases.
 
@@ -103,6 +119,17 @@ class PicardNSProblem(BaseProblem):
 
     def __init__(
         self,
+        parameters=None,
+        mesh=None,
+        XDMF=True,
+        HDF5=False,
+        domains=None,
+        boundaries=None,
+        windkessels=None,
+        element="P2-P1",
+        ds_quad_deg=3,
+        dx_quad_deg=4,
+        inlet_plateau_lam=None,
         f=None,
         dt=None,
         num_steps=None,
@@ -113,9 +140,18 @@ class PicardNSProblem(BaseProblem):
         sigma_BDF=2.0,
         tau_C_coefficient=0.4,
         supg_viscous=True,
-        **kwargs,
     ):
-        super().__init__(**kwargs)
+        self.parameters = parameters
+        self.mesh = mesh
+        self.XDMF = XDMF
+        self.HDF5 = HDF5
+        self.domains = domains
+        self.boundaries = boundaries
+        self.windkessels = windkessels
+        self.element = element
+        self.ds_quad_deg = ds_quad_deg
+        self.dx_quad_deg = dx_quad_deg
+        self.inlet_plateau_lam = inlet_plateau_lam
         self.f = f
         self.sigma_BDF = sigma_BDF
         self.tau_C_coefficient = tau_C_coefficient
@@ -128,6 +164,9 @@ class PicardNSProblem(BaseProblem):
         self._extra_bcs_arg = extra_bcs
         self.V, self.Q = self.function_space()
         self.set_problem()
+
+    # Distinguishes each instance's PETSc options prefix
+    _ksp_counter = 0
 
     # Polynomial degree of the velocity space
     @property
@@ -174,23 +213,31 @@ class PicardNSProblem(BaseProblem):
             target.x.scatter_forward()
         return self
 
-    # Build boundary conditions, forms, matrices and the solver
+    # Build the forms, matrices and solver. Supplied by the subclass.
     def set_problem(self):
-        pars = self.parameters
-        mesh = self.mesh
+        raise NotImplementedError("subclasses must build their own variational forms")
 
-        # Define measures for integrals
+    # Advance one time step. Supplied by the subclass.
+    def step(self, n_time, t, verbose=True, pre_step=None):
+        raise NotImplementedError("subclasses must implement their own nonlinear iteration")
+
+    # ---------------------------------------------------------------------------------
+    # Setup helpers, called from the subclasses' set_problem()
+    # ---------------------------------------------------------------------------------
+
+    # Define measures for integrals
+    def _setup_measures(self):
+        pars = self.parameters
         ds_deg = getattr(pars.Problem, "SurfaceQuadratureDegree", self.ds_quad_deg)
         dx_deg = getattr(pars.Problem, "VolumeQuadratureDegree", self.dx_quad_deg)
-        ds = Measure("ds", domain=mesh, subdomain_data=self.boundaries,
-                     metadata={"quadrature_degree": ds_deg})
-        dx = Measure("dx", domain=mesh, subdomain_data=self.domains,
-                     metadata={"quadrature_degree": dx_deg})
-        self.ds, self.dx = ds, dx
+        self.ds = Measure("ds", domain=self.mesh, subdomain_data=self.boundaries,
+                          metadata={"quadrature_degree": ds_deg})
+        self.dx = Measure("dx", domain=self.mesh, subdomain_data=self.domains,
+                          metadata={"quadrature_degree": dx_deg})
 
-        # ---------------------------------------------------------------------------------
-        # Time stepping data: taken from the arguments, else from the inflow waveform file
-        # ---------------------------------------------------------------------------------
+    # Time stepping data: taken from the arguments, else from the inflow waveform file
+    def _setup_time(self):
+        pars = self.parameters
         self.inflow = None
         profile_file = getattr(pars.Problem, "VelocityProfileFile", None)
         if profile_file is not None:
@@ -199,9 +246,9 @@ class PicardNSProblem(BaseProblem):
             )
 
         if self._dt_arg is not None:
-            dt_value = float(self._dt_arg)
+            self.dt_value = float(self._dt_arg)
         elif self.inflow is not None:
-            dt_value = float(self.inflow[1, 0] - self.inflow[0, 0])
+            self.dt_value = float(self.inflow[1, 0] - self.inflow[0, 0])
         else:
             raise ValueError("provide dt explicitly, or a Problem.VelocityProfileFile")
 
@@ -221,9 +268,10 @@ class PicardNSProblem(BaseProblem):
         else:
             self.inlet_scale_fn = lambda step, t: 0.0
 
-        # ---------------------------------------------------------------------------------
-        # Find inlet, outlets, and wall dofs
-        # ---------------------------------------------------------------------------------
+    # Find inlet, outlet and wall dofs, then build the boundary conditions
+    def _setup_bcs(self):
+        pars = self.parameters
+        mesh = self.mesh
         fdim = mesh.topology.dim - 1
 
         # WallID may be a single tag or a list: the DFG cylinder benchmark needs the channel walls and the obstacle tagged separately (so drag can be integrated over the obstacle alone) while both carry no slip
@@ -231,7 +279,7 @@ class PicardNSProblem(BaseProblem):
         wall_ids = [wall_id] if np.isscalar(wall_id) else list(wall_id)
         inlet_id = pars.Geometry.InletID
         outlet_ids = list(pars.Geometry.OutletIDs)
-        self.wall_ids, self.outlet_ids = wall_ids, outlet_ids
+        self.wall_ids, self.outlet_ids, self.inlet_id = wall_ids, outlet_ids, inlet_id
 
         wall_facets = (
             np.unique(np.hstack([self.boundaries.find(w) for w in wall_ids]))
@@ -255,9 +303,6 @@ class PicardNSProblem(BaseProblem):
                     f"OutletID {oid} matches no facets on this mesh; tags present: {tags_present}."
                 )
 
-        # ---------------------------------------------------------------------------------
-        # Boundary conditions
-        # ---------------------------------------------------------------------------------
         # Spatial shape of the inlet velocity
         if self._inlet_profile_arg is not None:
             par = self._inlet_profile_arg
@@ -294,11 +339,12 @@ class PicardNSProblem(BaseProblem):
             extra = self._extra_bcs_arg
             self.bcs += list(extra(self.V, self.Q) if callable(extra) else extra)
 
-        # Trial and test functions
-        u, v = TrialFunction(self.V), TestFunction(self.V)
-        p, q = TrialFunction(self.Q), TestFunction(self.Q)
+    # Solution functions, previous time levels and the physical coefficients
+    def _setup_state(self):
+        mesh = self.mesh
+        pars = self.parameters
 
-        # Initial conditions and the function holding the Picard iterate
+        # Initial conditions and the function the convection is linearized about
         self.u0 = Function(self.V)
         self.u00 = Function(self.V)
         self.up = Function(self.V)
@@ -314,117 +360,57 @@ class PicardNSProblem(BaseProblem):
         )
 
         # Time step, density and viscosity
-        dt = Constant(mesh, PETSc.ScalarType(dt_value))
-        rho = Constant(mesh, PETSc.ScalarType(pars.Problem.Density))
-        mu = Constant(mesh, PETSc.ScalarType(pars.Problem.Viscosity))
-        self.dt, self.rho, self.mu = dt, rho, mu
-        self.dt_value = dt_value
+        self.dt = Constant(mesh, PETSc.ScalarType(self.dt_value))
+        self.rho = Constant(mesh, PETSc.ScalarType(pars.Problem.Density))
+        self.mu = Constant(mesh, PETSc.ScalarType(pars.Problem.Viscosity))
 
-        # Normal vector to facets and backflow stabilization strength
-        n = FacetNormal(mesh)
-        beta = Constant(mesh, PETSc.ScalarType(getattr(pars.Problem, "BackflowBeta", 0.0)))
-        self.beta = beta
+        # Backflow stabilization strength
+        self.beta = Constant(mesh, PETSc.ScalarType(getattr(pars.Problem, "BackflowBeta", 0.0)))
 
-        # ---------------------------------------------------------------------------------
-        # Variational formulation (Galerkin part)
-        # ---------------------------------------------------------------------------------
-        a00_conv = rho * inner(grad(u) * self.up, v) * dx
-        a00 = rho / dt * inner(BDF2_THETA * u, v) * dx + 2 * mu * inner(eps(u), eps(v)) * dx
-        a01 = -p * div(v) * dx
-        a10 = -q * div(u) * dx
-        L0 = rho / dt * inner(2 * self.u0 - 0.5 * self.u00, v) * dx
-        L1 = Constant(mesh, PETSc.ScalarType(0.0)) * q * dx
-
-        # Body force
-        if self.f is not None:
-            L0 += inner(self.f, v) * dx
-
-        # Add backflow stabilization force at the outlets (explicit: built on the previous iterate, so it only ever reaches the right-hand side)
-        stab_force = backflow_stab(self.up, n, rho, beta)
-        for oid in outlet_ids:
-            L0 += dot(stab_force, v) * ds(oid)
-
-        # Windkessel outlet boundary condition, as a constant normal traction
-        if self.windkessels is not None:
-            for wksl in self.windkessels:
-                L0 += -dot(wksl.P_out * n, v) * ds(wksl.cap_id)
-
-        # ---------------------------------------------------------------------------------
-        # SUPG/PSPG stabilization
-        # ---------------------------------------------------------------------------------
-        tM = tau_M(
-            self.up, dt, rho, mu, mesh=mesh, sigma_BDF=self.sigma_BDF, degree=self.velocity_degree
+        # Stabilization parameters. tau_M is built on `up`, not on the solution: that keeps it frozen during a Newton iteration, which matters because differentiating sqrt(dot(u,u)) is singular at u = 0 and would produce nan on a cold start
+        self.tau_M = tau_M(
+            self.up, self.dt, self.rho, self.mu, mesh=mesh,
+            sigma_BDF=self.sigma_BDF, degree=self.velocity_degree,
         )
-        tC = tau_C(rho, mu, coefficient=self.tau_C_coefficient)
-        self.tau_M, self.tau_C = tM, tC
+        self.tau_C = tau_C(self.rho, self.mu, coefficient=self.tau_C_coefficient)
 
-        # The two halves of the strong momentum residual: the terms in the unknown u, and the known data at the previous time levels. Both carry a SINGLE factor of rho -- they are two halves of the same residual, and a mismatch makes the stabilization inconsistent, i.e. it no longer vanishes on the exact solution. An earlier revision squared rho on the implicit half only, which is invisible at rho = 1 but not at the rho = 1.06 of the physical cases. The viscous part is omitted because it vanishes elementwise for P1 velocities
-        res_lhs = rho * (BDF2_THETA / dt * u + grad(u) * self.up)
-        res_rhs = rho / dt * (2.0 * self.u0 - 0.5 * self.u00)
-        if self.f is not None:
-            res_rhs = res_rhs + self.f
+    # Allocate the block matrices and compose the nest
+    def _allocate_blocks(self, a00, a01, a10, alloc=None):
+        """
+        `a00`, `a01`, `a10` are the constant (iteration-independent) Galerkin forms. The iteration-dependent parts must already be on self.a**_star and compiled into self._f_a**_star.
 
-        # Momentum row: streamline weight (up.grad)v against the residual, plus grad-div
-        a_SUPG_00 = tM * inner(grad(v) * self.up, res_lhs) * dx
-        if self.supg_viscous:
-            a_SUPG_00 += tM * mu * inner(nabla_grad(grad(v) * self.up), nabla_grad(u)) * dx
-        a_SUPG_00 += tC * rho * div(u) * div(v) * dx
+        `alloc` optionally gives three extra forms whose stencils are unioned into the allocation. A subclass that assembles a *different* operator into these matrices must pass it, because NEW_NONZERO_LOCATIONS is switched off afterwards and any entry outside the pattern would then be silently dropped.
+        """
+        extra00, extra01, extra10 = alloc if alloc is not None else (None, None, None)
+        alloc00 = a00 + self.a00_star + (extra00 if extra00 is not None else 0 * a00)
+        alloc01 = a01 + self.a01_star + (extra01 if extra01 is not None else 0 * a01)
+        alloc10 = a10 + self.a10_star + (extra10 if extra10 is not None else 0 * a10)
 
-        # Pressure gradient in the momentum row (SUPG part)
-        a_SUPG_01 = tM * inner(grad(p), grad(v) * self.up) * dx
-
-        # Continuity row weighted by -grad(q) (PSPG), and the pressure-pressure coupling
-        a_PSPG_10 = tM * inner(-grad(q), res_lhs) * dx
-        a_PSPG_11 = tM * inner(-grad(q), grad(p)) * dx
-
-        # Consistent right-hand side counterparts
-        L0 += tM * inner(grad(v) * self.up, res_rhs) * dx
-        L1 += tM * inner(-grad(q), res_rhs) * dx
-
-        # Variational forms of the full 2x2 system
-        self.a = form([[a00 + a00_conv + a_SUPG_00, a01 + a_SUPG_01], [a10 + a_PSPG_10, a_PSPG_11]])
-        self.L = form([L0, L1])
-
-        # The blocks that change during the Picard iteration, i.e. everything depending on up
-        self.a00_star = a00_conv + a_SUPG_00
-        self.a01_star = a_SUPG_01
-        self.a10_star = a_PSPG_10
-        self.a11_star = a_PSPG_11
-
-        # Compile them once. Calling form() inside the Picard loop is not a recompilation (FFCx caches on disk) but it re-hashes the ufl signature and re-imports the module on every call, which is milliseconds times four blocks times every iteration
-        self._f_a00_star = form(self.a00_star)
-        self._f_a01_star = form(self.a01_star)
-        self._f_a10_star = form(self.a10_star)
-        self._f_a11_star = form(self.a11_star)
-
-        # ---------------------------------------------------------------------------------
-        # Assemble the matrices
-        # ---------------------------------------------------------------------------------
         # The *_star matrices are allocated against the COMBINED sparsity pattern, so that the later axpy with the constant block never needs a new nonzero location
-        self.A00_star = create_matrix(form(a00 + self.a00_star))
+        self.A00_star = create_matrix(form(alloc00))
         self.A00_star.setOption(PETSc.Mat.Option.IGNORE_ZERO_ENTRIES, False)
         assemble_matrix(self.A00_star, self._f_a00_star, bcs=self.bcs, diag=0.0)
         self.A00_star.assemble()
         self.A00_star.setOption(PETSc.Mat.Option.NEW_NONZERO_LOCATIONS, False)
 
-        self.A01_star = create_matrix(form(a01 + self.a01_star))
+        self.A01_star = create_matrix(form(alloc01))
         self.A01_star.setOption(PETSc.Mat.Option.IGNORE_ZERO_ENTRIES, False)
         assemble_matrix(self.A01_star, self._f_a01_star, bcs=self.bcs, diag=0.0)
         self.A01_star.assemble()
         self.A01_star.setOption(PETSc.Mat.Option.NEW_NONZERO_LOCATIONS, False)
 
-        self.A10_star = create_matrix(form(a10 + self.a10_star))
+        self.A10_star = create_matrix(form(alloc10))
         self.A10_star.setOption(PETSc.Mat.Option.IGNORE_ZERO_ENTRIES, False)
         assemble_matrix(self.A10_star, self._f_a10_star, bcs=self.bcs, diag=0.0)
         self.A10_star.assemble()
         self.A10_star.setOption(PETSc.Mat.Option.NEW_NONZERO_LOCATIONS, False)
 
-        # The (1,1) block is the PSPG pressure Laplacian. It carries no convective velocity, but it is still weighted by tau_M, which is built on `up` and therefore changes with every Picard iterate -- so it is re-assembled in _assemble_system alongside the other three. Passing the full bc list is deliberate: both spaces here are the pressure space, so VELOCITY conditions match neither and dolfinx discards them (which is why passing them used to be a silent no-op), but a PRESSURE condition in the list is applied, and that is what makes the block non-singular in the fully-Dirichlet case
+        # The (1,1) PSPG block. It is allocated here and re-assembled every iteration like the others: tau_M is built on `up`, so this block depends on the iterate too. Treating it as constant leaves it at its tau_M(up = 0) value, which makes the continuity row weight tau_M(up) in its (1,0) part and tau_M(0) here -- no longer one consistent strong residual, so the stabilization stops vanishing on the exact solution. Passing the full bc list is deliberate: both spaces here are the pressure space, so VELOCITY conditions match neither and dolfinx discards them, but a PRESSURE condition in the list is applied, and that is what makes the block non-singular in the fully-Dirichlet case
         self.A11_star = create_matrix(form(self.a11_star))
         self.A11_star.setOption(PETSc.Mat.Option.SYMMETRIC, True)
         self.A11_star.setOption(PETSc.Mat.Option.SYMMETRY_ETERNAL, True)
         self.A11_star.setOption(PETSc.Mat.Option.IGNORE_ZERO_ENTRIES, True)
-        assemble_matrix(self.A11_star, self._f_a11_star, bcs=self.bcs, diag=1.0)
+        assemble_matrix(self.A11_star, form(self.a11_star), bcs=self.bcs, diag=1.0)
         self.A11_star.assemble()
         self.A11_star.setOption(PETSc.Mat.Option.NEW_NONZERO_LOCATIONS, False)
 
@@ -462,12 +448,27 @@ class PicardNSProblem(BaseProblem):
         self.A.assemble()
         self.A.setOption(PETSc.Mat.Option.NEW_NONZERO_LOCATIONS, False)
 
-        # ---------------------------------------------------------------------------------
-        # Create and configure solver
-        # ---------------------------------------------------------------------------------
-        self.ksp = PETSc.KSP().create(mesh.comm)
-        self.ksp.setOperators(self.A)
-        opts = PETSc.Options()
+    # Create and configure solver
+    def _setup_solver(self, operator=None):
+        """
+        `operator` is the matrix the Krylov method applies. It defaults to the assembled nest; a subclass may pass a different one (a low-rank correction of it, say), in which case the nest is still used as the preconditioner.
+        """
+        pars = self.parameters
+        self.ksp = PETSc.KSP().create(self.mesh.comm)
+        if operator is None or operator is self.A:
+            self.ksp.setOperators(self.A)
+        else:
+            # Krylov sees the exact operator, the preconditioner keeps the sparse nest
+            self.ksp.setOperators(operator, self.A)
+
+        # PETSc's options database is global and persists for the life of the process, so two
+        # problems built in the same session would otherwise read each other's settings --
+        # a direct solver picking up a leftover fieldsplit preconditioner, say. Giving each
+        # instance its own prefix isolates them.
+        BaseProblem._ksp_counter += 1
+        prefix = f"ns{BaseProblem._ksp_counter}_"
+        self.ksp.setOptionsPrefix(prefix)
+        opts = _PrefixedOptions(prefix)
 
         if pars.Solver.Kind == "iterative":
             # FGMRES preconditioned by a Schur-complement fieldsplit, with one BoomerAMG V-cycle on each block. Required for the 3D patient-specific meshes, where a direct factorization does not fit
@@ -495,8 +496,15 @@ class PicardNSProblem(BaseProblem):
                 opts[f"fieldsplit_{blk}_pc_hypre_boomeramg_relax_weight_all"] = 0.0
 
         elif pars.Solver.Kind == "direct":
-            # Direct LU with MUMPS: robust, and the right choice for the small 2D cases
-            self.ksp.setType("preonly")
+            # Direct LU with MUMPS: robust, and the right choice for the small 2D cases.
+            #
+            # When the operator differs from the preconditioner, `preonly` would apply only the LU of the preconditioner and so silently solve the WRONG system. Iterate instead: preconditioned by an exact factorization of the sparse part, GMRES converges in a couple of iterations.
+            if operator is None or operator is self.A:
+                self.ksp.setType("preonly")
+            else:
+                self.ksp.setType("gmres")
+                opts["ksp_rtol"] = getattr(pars.Solver, "SolverRTol", 1.0e-10)
+                opts["ksp_max_it"] = 100
             self.ksp.getPC().setType("lu")
             self.ksp.getPC().setFactorSolverType("mumps")
             self.ksp.getPC().setReusePreconditioner(False)
@@ -511,130 +519,31 @@ class PicardNSProblem(BaseProblem):
         # Apply options and set up solver
         self.ksp.setFromOptions()
 
-        # Forms used by the Picard convergence test, also compiled once
+    # Forms used by the convergence test, compiled once
+    def _setup_convergence_forms(self):
         self._diff = Function(self.V)
-        self._err_num = form(inner(self._diff, self._diff) * dx)
-        self._err_den = form(inner(self.u_h, self.u_h) * dx)
+        self._err_num = form(inner(self._diff, self._diff) * self.dx)
+        self._err_den = form(inner(self.u_h, self.u_h) * self.dx)
 
-    # Re-assemble the iteration-dependent blocks and the right-hand side
-    def _assemble_system(self):
-        # Assemble right-hand side vector
-        b = assemble_vector(self.L, kind="nest")
-
-        # Modify ('lift') the RHS for the Dirichlet boundary conditions
-        bcs1 = bcs_by_block(extract_function_spaces(self.a), self.bcs)
-        apply_lifting(b, self.a, bcs=bcs1)
-
-        # Sum contributions for entries shared across parallel processes
-        for b_sub in b.getNestSubVecs():
-            b_sub.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
-
-        # Set the Dirichlet values in the RHS vector
-        bcs0 = bcs_by_block(extract_function_spaces(self.L), self.bcs)
-        set_bc(b, bcs0)
-
-        # Re-assemble convection and stabilization, then add the stored constant blocks back
-        for A_star, f_star, A_const in ((self.A00_star, self._f_a00_star, self.A00),
-                                        (self.A01_star, self._f_a01_star, self.A01),
-                                        (self.A10_star, self._f_a10_star, self.A10)):
-            A_star.zeroEntries()
-            assemble_matrix(A_star, f_star, bcs=self.bcs, diag=0.0)
-            A_star.assemble()
-            A_star.axpy(1.0, A_const)
-
-        # The (1,1) block has no constant counterpart to add back, but it is iterate-dependent through tau_M and must be refreshed too. Leaving it at its cold-start value, tau_M(up = 0), makes the continuity row weight a different strong residual from the momentum row, so the two stop being consistent parts of one stabilized system
-        self.A11_star.zeroEntries()
-        assemble_matrix(self.A11_star, self._f_a11_star, bcs=self.bcs, diag=1.0)
-        self.A11_star.assemble()
-
-        self.A.assemble()
-        return b
-
-    # Advance one time step by Picard-iterating to convergence
-    def step(self, n_time, t, verbose=True, pre_step=None):
-        """
-        Returns a dict with the iteration count, the two error measures and whether the step converged. 'pre_step(problem, n_time, t)' is called first, which is where time-dependent data held by reference in the forms (a manufactured body force, say) must be advanced to the new time level.
-        """
-        if pre_step is not None:
-            pre_step(self, n_time, t)
-
-        pars = self.parameters
-        max_nl_iter = pars.Solver.MaxNonlinearIterations
-        nl_tol = pars.Solver.NonlinearTolerance
-        rank = self.mesh.comm.rank
-
-        # Update inlet velocity profile
+    # Update the inlet velocity to the new time level
+    def _update_inlet(self, n_time, t):
         self.u_inlet_scale.value = self.inlet_scale_fn(n_time, t)
         self.u_inlet.interpolate(self.u_inlet_expr)
 
-        nl_error = np.inf
-        wk_error = np.inf if self.windkessels else 0.0
-        it = 0
-        converged = False
+    # Relative L2 difference between the current solution and `other`
+    def _relative_velocity_change(self, other):
+        self._diff.x.array[:] = other.x.array - self.u_h.x.array
+        num = self.mesh.comm.allreduce(assemble_scalar(self._err_num), op=MPI.SUM)
+        den = self.mesh.comm.allreduce(assemble_scalar(self._err_den), op=MPI.SUM)
+        return float(np.sqrt(num / den)) if den > 0.0 else 0.0
 
-        # Nonlinear iterations
-        while it < max_nl_iter:
-            if verbose and rank == 0:
-                print(f"  [Picard] Nonlinear iteration {it:d}", flush=True)
-
-            # Update the windkessels from the current iterate
-            if self.windkessels is not None:
-                for wksl in self.windkessels:
-                    wksl.update(self.up, verbose=verbose)
-
-            # Assemble and solve
-            b = self._assemble_system()
-            self.ksp.setOperators(self.A)
-            self.ksp.solve(b, self.x)
-            self.u_h.x.scatter_forward()
-            self.p_h.x.scatter_forward()
-
-            reason = self.ksp.getConvergedReason()
-            if reason < 0:
-                raise RuntimeError(
-                    f"linear solve diverged at step {n_time} iteration {it} (KSPConvergedReason={reason})"
-                )
-
-            # Relative L2 error between successive Picard iterates
-            self._diff.x.array[:] = self.up.x.array - self.u_h.x.array
-            num = self.mesh.comm.allreduce(assemble_scalar(self._err_num), op=MPI.SUM)
-            den = self.mesh.comm.allreduce(assemble_scalar(self._err_den), op=MPI.SUM)
-            nl_error = float(np.sqrt(num / den)) if den > 0.0 else 0.0
-
-            # Windkessel convergence measure
-            if self.windkessels is not None:
-                wk_error = max(w.residual() for w in self.windkessels)
-
-            # Update the iterate
-            self.up.x.array[:] = self.u_h.x.array
-            if self.windkessels is not None:
-                for wksl in self.windkessels:
-                    wksl.Pd_nl_prev = wksl.Pd_nl
-
-            if verbose and rank == 0:
-                print(f"      Nonlinear error: {nl_error:.2e}", flush=True)
-                if self.windkessels is not None:
-                    print(f"      Windkessel iteration error: {wk_error:.2e}", flush=True)
-
-            b.destroy()
-            it += 1
-            if nl_error < nl_tol and wk_error < nl_tol:
-                converged = True
-                break
-
-        # Update previous time step
+    # Roll the solution into the previous time levels
+    def _advance_time_levels(self):
         if self.windkessels is not None:
             for wksl in self.windkessels:
                 wksl.advance()
         self.u00.x.array[:] = self.u0.x.array
         self.u0.x.array[:] = self.u_h.x.array
-
-        return {
-            "iterations": it,
-            "nl_error": nl_error,
-            "wk_error": wk_error,
-            "converged": converged,
-        }
 
     # Time stepping loop
     def solve(
@@ -693,9 +602,10 @@ class PicardNSProblem(BaseProblem):
                 # Print time required to solve the current time step
                 if rank == 0:
                     status = "converged" if info["converged"] else "NOT converged"
+                    method = info.get("method", "picard")
                     print(
-                        "  Time step {} in {:.1f} seconds ({} Picard iterations)".format(
-                            status, info["wall_time"], info["iterations"]
+                        "  Time step {} in {:.1f} seconds ({} {} iterations)".format(
+                            status, info["wall_time"], info["iterations"], method
                         ),
                         flush=True,
                     )
@@ -721,3 +631,599 @@ class PicardNSProblem(BaseProblem):
                 file_p.close()
 
         return history
+
+
+# BDF2 / Picard stabilized Navier-Stokes problem
+class PicardNSProblem(BaseProblem):
+    """
+    Convection is linearized about the previous iterate, giving an Oseen problem at every nonlinear iteration. Robust from any starting point, including rest, but only linearly convergent.
+
+    See BaseProblem for the constructor arguments.
+    """
+
+    # Build boundary conditions, forms, matrices and the solver
+    def set_problem(self):
+        self._setup_measures()
+        self._setup_time()
+        self._setup_bcs()
+        self._setup_state()
+        a00, a01, a10 = self._build_oseen_forms()
+        self._allocate_blocks(a00, a01, a10)
+        self._setup_solver()
+        self._setup_convergence_forms()
+
+    # The Oseen (Picard) forms.
+    #
+    # Lives here rather than inline in set_problem because NewtonNSProblem needs it too: it
+    # runs a Picard step on the first time level, where there is no previous solution to
+    # start Newton from, and again whenever a Newton step fails to converge.
+    def _build_oseen_forms(self):
+        """
+        Sets self.a, self.L and the four a**_star forms, and returns the constant Galerkin blocks (a00, a01, a10) for the matrix allocation.
+        """
+        mesh = self.mesh
+        dx, ds = self.dx, self.ds
+        dt, rho, mu, beta = self.dt, self.rho, self.mu, self.beta
+        tM, tC = self.tau_M, self.tau_C
+        n = FacetNormal(mesh)
+
+        # Trial and test functions
+        u, v = TrialFunction(self.V), TestFunction(self.V)
+        p, q = TrialFunction(self.Q), TestFunction(self.Q)
+
+        # ---------------------------------------------------------------------------------
+        # Variational formulation (Galerkin part)
+        # ---------------------------------------------------------------------------------
+        a00_conv = rho * inner(grad(u) * self.up, v) * dx
+        a00 = rho / dt * inner(BDF2_THETA * u, v) * dx + 2 * mu * inner(eps(u), eps(v)) * dx
+        a01 = -p * div(v) * dx
+        a10 = -q * div(u) * dx
+        L0 = rho / dt * inner(2 * self.u0 - 0.5 * self.u00, v) * dx
+        L1 = Constant(mesh, PETSc.ScalarType(0.0)) * q * dx
+
+        # Body force
+        if self.f is not None:
+            L0 += inner(self.f, v) * dx
+
+        # Add backflow stabilization force at the outlets (explicit: built on the previous iterate, so it only ever reaches the right-hand side)
+        stab_force = backflow_stab(self.up, n, rho, beta)
+        for oid in self.outlet_ids:
+            L0 += dot(stab_force, v) * ds(oid)
+
+        # Windkessel outlet boundary condition, as a constant normal traction
+        if self.windkessels is not None:
+            for wksl in self.windkessels:
+                L0 += -dot(wksl.P_out * n, v) * ds(wksl.cap_id)
+
+        # ---------------------------------------------------------------------------------
+        # SUPG/PSPG stabilization
+        # ---------------------------------------------------------------------------------
+        # The two halves of the strong momentum residual: the terms in the unknown u, and the known data at the previous time levels. Both carry a SINGLE factor of rho -- they are two halves of the same residual, and a mismatch makes the stabilization inconsistent, i.e. it no longer vanishes on the exact solution. An earlier revision squared rho on the implicit half only, which is invisible at rho = 1 but not at the rho = 1.06 of the physical cases. The viscous part is omitted because it vanishes elementwise for P1 velocities
+        res_lhs = rho * (BDF2_THETA / dt * u + grad(u) * self.up)
+        res_rhs = rho / dt * (2.0 * self.u0 - 0.5 * self.u00)
+        if self.f is not None:
+            res_rhs = res_rhs + self.f
+
+        # Momentum row: streamline weight (up.grad)v against the residual, plus grad-div
+        a_SUPG_00 = tM * inner(grad(v) * self.up, res_lhs) * dx
+        if self.supg_viscous:
+            a_SUPG_00 += tM * mu * inner(nabla_grad(grad(v) * self.up), nabla_grad(u)) * dx
+        a_SUPG_00 += tC * rho * div(u) * div(v) * dx
+
+        # Pressure gradient in the momentum row (SUPG part)
+        a_SUPG_01 = tM * inner(grad(p), grad(v) * self.up) * dx
+
+        # Continuity row weighted by -grad(q) (PSPG), and the pressure-pressure coupling
+        a_PSPG_10 = tM * inner(-grad(q), res_lhs) * dx
+        a_PSPG_11 = tM * inner(-grad(q), grad(p)) * dx
+
+        # Consistent right-hand side counterparts
+        L0 += tM * inner(grad(v) * self.up, res_rhs) * dx
+        L1 += tM * inner(-grad(q), res_rhs) * dx
+
+        # Variational forms of the full 2x2 system
+        self.a = form([[a00 + a00_conv + a_SUPG_00, a01 + a_SUPG_01], [a10 + a_PSPG_10, a_PSPG_11]])
+        self.L = form([L0, L1])
+
+        # The blocks that change during the Picard iteration, i.e. everything depending on up
+        self.a00_star = a00_conv + a_SUPG_00
+        self.a01_star = a_SUPG_01
+        self.a10_star = a_PSPG_10
+        self.a11_star = a_PSPG_11
+
+        # Compile them once. Calling form() inside the Picard loop is not a recompilation (FFCx caches on disk) but it re-hashes the ufl signature and re-imports the module on every call, which is milliseconds times four blocks times every iteration
+        self._f_a00_star = form(self.a00_star)
+        self._f_a01_star = form(self.a01_star)
+        self._f_a10_star = form(self.a10_star)
+        self._f_a11_star = form(self.a11_star)
+
+        return a00, a01, a10
+
+    # Re-assemble the iteration-dependent blocks and the right-hand side
+    def _assemble_system(self):
+        # Assemble right-hand side vector
+        b = assemble_vector(self.L, kind="nest")
+
+        # Modify ('lift') the RHS for the Dirichlet boundary conditions
+        bcs1 = bcs_by_block(extract_function_spaces(self.a), self.bcs)
+        apply_lifting(b, self.a, bcs=bcs1)
+
+        # Sum contributions for entries shared across parallel processes
+        for b_sub in b.getNestSubVecs():
+            b_sub.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+
+        # Set the Dirichlet values in the RHS vector
+        bcs0 = bcs_by_block(extract_function_spaces(self.L), self.bcs)
+        set_bc(b, bcs0)
+
+        # Re-assemble convection and stabilization, then add the stored constant blocks back
+        for A_star, f_star, A_const in ((self.A00_star, self._f_a00_star, self.A00),
+                                        (self.A01_star, self._f_a01_star, self.A01),
+                                        (self.A10_star, self._f_a10_star, self.A10)):
+            A_star.zeroEntries()
+            assemble_matrix(A_star, f_star, bcs=self.bcs, diag=0.0)
+            A_star.assemble()
+            A_star.axpy(1.0, A_const)
+
+        # The (1,1) block has no constant counterpart, but it is iterate-dependent through tau_M
+        # and must be refreshed too
+        self.A11_star.zeroEntries()
+        assemble_matrix(self.A11_star, self._f_a11_star, bcs=self.bcs, diag=1.0)
+        self.A11_star.assemble()
+
+        self.A.assemble()
+        return b
+
+    # Picard-iterate to convergence at the current time level
+    def _oseen_step(self, n_time, verbose=True):
+        """
+        Does not touch the inlet velocity or the previous time levels; the caller owns those, so that a Newton step can fall back to this one and redo the same time step.
+        """
+        pars = self.parameters
+        max_nl_iter = pars.Solver.MaxNonlinearIterations
+        nl_tol = pars.Solver.NonlinearTolerance
+        rank = self.mesh.comm.rank
+
+        nl_error = np.inf
+        wk_error = np.inf if self.windkessels else 0.0
+        it = 0
+        converged = False
+
+        # Nonlinear iterations
+        while it < max_nl_iter:
+            if verbose and rank == 0:
+                print(f"  [Picard] Nonlinear iteration {it:d}", flush=True)
+
+            # Update the windkessels from the current iterate
+            if self.windkessels is not None:
+                for wksl in self.windkessels:
+                    wksl.update(self.up, verbose=verbose)
+
+            # Assemble and solve
+            b = self._assemble_system()
+            self.ksp.setOperators(self.A)
+            self.ksp.solve(b, self.x)
+            self.u_h.x.scatter_forward()
+            self.p_h.x.scatter_forward()
+
+            reason = self.ksp.getConvergedReason()
+            if reason < 0:
+                raise RuntimeError(
+                    f"linear solve diverged at step {n_time} iteration {it} (KSPConvergedReason={reason})"
+                )
+
+            # Relative L2 error between successive Picard iterates
+            nl_error = self._relative_velocity_change(self.up)
+
+            # Windkessel convergence measure
+            if self.windkessels is not None:
+                wk_error = max(w.residual() for w in self.windkessels)
+
+            # Update the iterate
+            self.up.x.array[:] = self.u_h.x.array
+            if self.windkessels is not None:
+                for wksl in self.windkessels:
+                    wksl.Pd_nl_prev = wksl.Pd_nl
+
+            if verbose and rank == 0:
+                print(f"      Nonlinear error: {nl_error:.2e}", flush=True)
+                if self.windkessels is not None:
+                    print(f"      Windkessel iteration error: {wk_error:.2e}", flush=True)
+
+            b.destroy()
+            it += 1
+            if nl_error < nl_tol and wk_error < nl_tol:
+                converged = True
+                break
+
+        return {
+            "iterations": it,
+            "nl_error": nl_error,
+            "wk_error": wk_error,
+            "converged": converged,
+            "method": "picard",
+        }
+
+    # Advance one time step by Picard-iterating to convergence
+    def step(self, n_time, t, verbose=True, pre_step=None):
+        """
+        Returns a dict with the iteration count, the two error measures and whether the step converged. 'pre_step(problem, n_time, t)' is called first, which is where time-dependent data held by reference in the forms (a manufactured body force, say) must be advanced to the new time level.
+        """
+        if pre_step is not None:
+            pre_step(self, n_time, t)
+
+        self._update_inlet(n_time, t)
+        info = self._oseen_step(n_time, verbose=verbose)
+        self._advance_time_levels()
+        return info
+
+
+# Applies the exact Windkessel coupling on top of the assembled blocks
+class _WindkesselJacobian:
+    """
+    Shell operator adding the rank-one outlet terms to the sparse Jacobian.
+
+    The outlet pressure depends on the velocity through the flow rate, `P_out = Rp*Q + Pd(Q)` with `Q = integral(u.n) over the cap`, so the exact Jacobian carries a contribution `Z_k * a_k a_k^T` per outlet, where `(a_k)_i = integral(phi_i.n)` over the cap and `Z_k = dP_out/dQ` is the impedance the outlet presents over one time step.
+
+    That block is dense on the cap dofs. Inserting it into the sparse matrix would cost a few million extra nonzeros on the aorta and would wreck BoomerAMG, which does badly with dense rows. Applying it as a shell instead leaves the assembled nest untouched, so it can still serve as the preconditioner while the Krylov method sees the exact operator.
+    """
+
+    def __init__(self, base, vectors, impedances, velocity_is):
+        self.base = base
+        self.vectors = vectors
+        self.impedances = impedances
+        # Index set of the velocity block within the nest. Going through it rather than
+        # getNestSubVecs() is what makes this work for both layouts a MatNest may hand out:
+        # sometimes a VecNest, sometimes a flat vector, depending on how the nest was built.
+        self.velocity_is = velocity_is
+
+    def mult(self, mat, x, y):
+        self.base.mult(x, y)
+
+        # The correction lives entirely in the velocity block
+        xu = x.getSubVector(self.velocity_is)
+        yu = y.getSubVector(self.velocity_is)
+        try:
+            for vec, Z in zip(self.vectors, self.impedances, strict=True):
+                yu.axpy(Z * vec.dot(xu), vec)
+        finally:
+            x.restoreSubVector(self.velocity_is, xu)
+            y.restoreSubVector(self.velocity_is, yu)
+
+    def multTranspose(self, mat, x, y):
+        # The correction is symmetric, so the transpose is the same operation
+        self.mult(mat, x, y)
+
+
+# BDF2 / Newton stabilized Navier-Stokes problem
+class NewtonNSProblem(PicardNSProblem):
+    """
+    Solves the true nonlinear residual with its exact Jacobian, obtained from the residual by `ufl.derivative`.
+
+    Compared with the Picard scheme the (0,0) block gains the term `rho*(grad(u).du, v)` -- the part Picard drops by freezing the convecting velocity -- and the backflow traction becomes implicit. Convergence is quadratic rather than linear, but only from a starting guess close enough to the solution.
+
+    Two things supply that guess. The first time step runs Picard, since there is no previous solution to start from; every later step starts from the previous step's converged solution, which is `O(dt)` away. If a Newton step still fails to converge, the step is redone with Picard and the fact recorded in the step's info dictionary, so a long run cannot be lost to one bad step.
+
+    `tau_M` is deliberately *not* differentiated. It is built on `up` rather than on the solution, so `ufl.derivative` steps over it. That is the standard frozen-parameter Newton, and it is not optional here: `tau_M` contains `sqrt(dot(u,u))`, whose derivative is singular at `u = 0`, and differentiating through it produces `nan` on a cold start.
+
+    Extra argument beyond BaseProblem:
+
+      windkessel_jacobian - include the exact rank-one outlet term in the Jacobian (default True). Setting it False lags the coupling instead, as the Picard scheme does, which gives a quasi-Newton method that is cheaper per iteration but loses the quadratic rate on Windkessel-dominated problems.
+    """
+
+    def __init__(self, windkessel_jacobian=True, **kwargs):
+        self.windkessel_jacobian = windkessel_jacobian
+        super().__init__(**kwargs)
+
+    # Build boundary conditions, forms, matrices and the solver
+    def set_problem(self):
+        self._setup_measures()
+        self._setup_time()
+        self._setup_bcs()
+        self._setup_state()
+
+        # The Oseen forms are built too: they carry the first time step and any fallback
+        a00, a01, a10 = self._build_oseen_forms()
+        j00, j01, j10 = self._build_newton_forms()
+
+        # Allocate against the union of both stencils, since both operators are assembled
+        # into the same matrices
+        self._allocate_blocks(a00, a01, a10, alloc=(j00, j01, j10))
+        self._setup_windkessel_jacobian()
+        self._setup_solver(operator=self._newton_operator)
+        self._setup_convergence_forms()
+
+        # Increment functions. Newton solves for a correction, so the solution vector
+        # cannot be written into directly the way the Picard iteration does.
+        # Named dx_vec, not dx: self.dx is the volume integration measure
+        self.du_h, self.dp_h = Function(self.V), Function(self.Q)
+        self.dx_vec = PETSc.Vec().createNest(
+            [create_vector_wrap(self.du_h.x), create_vector_wrap(self.dp_h.x)]
+        )
+
+    # The nonlinear residual and its Jacobian
+    def _build_newton_forms(self):
+        """
+        Sets self._F_form (the residual) and self._J_form (the Jacobian), and returns the three Jacobian blocks whose stencils the matrix allocation must cover.
+
+        The residual is written in terms of the solution functions u_h and p_h rather than trial functions, which is what lets ufl.derivative produce the Jacobian.
+        """
+        mesh = self.mesh
+        dx, ds = self.dx, self.ds
+        dt, rho, mu, beta = self.dt, self.rho, self.mu, self.beta
+        tM, tC = self.tau_M, self.tau_C
+        n = FacetNormal(mesh)
+        u_h, p_h = self.u_h, self.p_h
+
+        v, q = TestFunction(self.V), TestFunction(self.Q)
+        du, dp = TrialFunction(self.V), TrialFunction(self.Q)
+
+        # Strong residual of the momentum equation, now fully nonlinear: the convecting
+        # velocity is the solution itself, not a frozen iterate
+        R = rho / dt * (BDF2_THETA * u_h - 2.0 * self.u0 + 0.5 * self.u00) + rho * grad(u_h) * u_h
+        if self.f is not None:
+            R = R - self.f
+
+        # Momentum row. Signs follow from the Picard system a*u = L: the residual is
+        # a*u - L, so every term that appears on the right-hand side there enters here
+        # with the opposite sign.
+        F0 = (
+            rho / dt * inner(BDF2_THETA * u_h - 2.0 * self.u0 + 0.5 * self.u00, v) * dx
+            + rho * inner(grad(u_h) * u_h, v) * dx
+            + 2 * mu * inner(eps(u_h), eps(v)) * dx
+            - p_h * div(v) * dx
+        )
+        if self.f is not None:
+            F0 -= inner(self.f, v) * dx
+
+        # Backflow traction, implicit here rather than lagged. ufl.derivative handles the
+        # Abs() it contains; the result is not smooth at u.n = 0, which can slow Newton
+        # during flow reversal but does not stop it.
+        stab_force = backflow_stab(u_h, n, rho, beta)
+        for oid in self.outlet_ids:
+            F0 -= dot(stab_force, v) * ds(oid)
+
+        # Windkessel outlet traction. P_out is a Constant, so ufl.derivative sees no
+        # dependence on u_h; the exact coupling is added separately as a rank-one term.
+        if self.windkessels is not None:
+            for wksl in self.windkessels:
+                F0 += dot(wksl.P_out * n, v) * ds(wksl.cap_id)
+
+        # Stabilization. The weight grad(v)*up and tau_M stay frozen on `up`.
+        F0 += tM * inner(grad(v) * self.up, R) * dx
+        if self.supg_viscous:
+            F0 += tM * mu * inner(nabla_grad(grad(v) * self.up), nabla_grad(u_h)) * dx
+        F0 += tM * inner(grad(p_h), grad(v) * self.up) * dx
+        F0 += tC * rho * div(u_h) * div(v) * dx
+
+        # Continuity row, weighted by -grad(q) for the PSPG part
+        F1 = (
+            -q * div(u_h) * dx
+            + tM * inner(-grad(q), R) * dx
+            + tM * inner(-grad(q), grad(p_h)) * dx
+        )
+
+        # Jacobian, block by block
+        j00 = derivative(F0, u_h, du)
+        j01 = derivative(F0, p_h, dp)
+        j10 = derivative(F1, u_h, du)
+        j11 = derivative(F1, p_h, dp)
+
+        self._F_form = form([F0, F1])
+        self._J_form = form([[j00, j01], [j10, j11]])
+        self._f_j00, self._f_j01 = form(j00), form(j01)
+        self._f_j10, self._f_j11 = form(j10), form(j11)
+        return j00, j01, j10
+
+    # Cap vectors and impedances for the exact outlet coupling
+    def _setup_windkessel_jacobian(self):
+        self._wk_vectors = []
+        self._wk_impedance = []
+        self._newton_operator = None
+
+        if not self.windkessels or not self.windkessel_jacobian:
+            return
+
+        v = TestFunction(self.V)
+        n = FacetNormal(self.mesh)
+        n_owned = self.V.dofmap.index_map.size_local * self.V.dofmap.index_map_bs
+
+        for wksl in self.windkessels:
+            # a_k, the vector of integrals of each basis function against the cap normal, in
+            # the velocity space layout. The shell applies it to the velocity sub-block, so it
+            # needs no padding over the pressure dofs.
+            cap = assemble_vector(form(dot(v, n) * self.ds(wksl.cap_id)))
+            cap.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+
+            # Zero the constrained dofs. Every outlet rim meets the no-slip wall, and a
+            # constrained row of the Jacobian must stay a unit row or the increment leaks
+            # through the wall there.
+            constrained = [
+                bc._cpp_object.dof_indices()[0]
+                for bc in self.bcs
+                if bc.function_space == self.V._cpp_object
+            ]
+            if constrained:
+                idx = np.unique(np.hstack(constrained))
+                idx = idx[idx < n_owned]
+                cap.getArray()[idx] = 0.0
+            cap.assemble()
+
+            self._wk_vectors.append(cap)
+            self._wk_impedance.append(self._outlet_impedance(wksl))
+
+        velocity_is = self.A.getNestISs()[0][0]
+        ctx = _WindkesselJacobian(self.A, self._wk_vectors, self._wk_impedance, velocity_is)
+        self._newton_operator = PETSc.Mat().createPython(
+            self.A.getSizes(), ctx, comm=self.mesh.comm
+        )
+        self._newton_operator.setUp()
+
+    # dP_out/dQ for one outlet over a single time step
+    @staticmethod
+    def _outlet_impedance(wksl):
+        """
+        For the linear RCR ODE with the flow rate held constant across the step, the distal pressure has the closed form `Pd = Pd_prev*exp(-dt/(Rd*C)) + Rd*Q*(1 - exp(-dt/(Rd*C)))`, so
+
+            dP_out/dQ = Rp + Rd*(1 - exp(-dt/(Rd*C)))
+
+        which agrees with a finite difference of Windkessel.RK4 to about 1e-9 relative.
+        """
+        decay = np.exp(-wksl.dt_sim / (wksl.Rd * wksl.C))
+        return wksl.Rp + wksl.Rd * (1.0 - decay)
+
+    # Refresh the impedances, in case a Windkessel parameter changed after construction
+    def _refresh_impedances(self):
+        for i, wksl in enumerate(self.windkessels or []):
+            if i < len(self._wk_impedance):
+                self._wk_impedance[i] = self._outlet_impedance(wksl)
+
+    # Assemble the residual and the Jacobian at the current iterate
+    def _assemble_newton_system(self):
+        """
+        Returns the right-hand side for `J dx = b`, from which the update is `u -= dx`.
+
+        The boundary conditions are applied in increment form: `set_bc` with `x0` and `alpha=-1` puts `u_h - g` in the constrained entries, so the correction drives the solution onto the Dirichlet data. That handles the inhomogeneous inlet profile and the pressure pin identically, with no separate homogeneous conditions needed.
+        """
+        # self.x is the nest wrapping u_h and p_h, i.e. the current iterate. The lifting
+        # and boundary helpers take the nest itself and split it internally.
+        b = assemble_vector(self._F_form, kind="nest")
+        bcs1 = bcs_by_block(extract_function_spaces(self._J_form), self.bcs)
+        apply_lifting(b, self._J_form, bcs=bcs1, x0=self.x, alpha=-1)
+        for b_sub in b.getNestSubVecs():
+            b_sub.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+        bcs0 = bcs_by_block(extract_function_spaces(self._F_form), self.bcs)
+        set_bc(b, bcs0, x0=self.x, alpha=-1)
+
+        # Jacobian. Unlike the Picard path there is no constant-plus-axpy split: every
+        # block depends on the iterate, so each is assembled whole.
+        for A_blk, f_blk, square in (
+            (self.A00_star, self._f_j00, True),
+            (self.A01_star, self._f_j01, False),
+            (self.A10_star, self._f_j10, False),
+            (self.A11_star, self._f_j11, True),
+        ):
+            A_blk.zeroEntries()
+            if square:
+                assemble_matrix(A_blk, f_blk, bcs=self.bcs, diag=1.0)
+            else:
+                assemble_matrix(A_blk, f_blk, bcs=self.bcs)
+            A_blk.assemble()
+
+        self.A.assemble()
+        return b
+
+    # Newton-iterate to convergence at the current time level
+    def _newton_step(self, n_time, verbose=True):
+        pars = self.parameters
+        max_nl_iter = pars.Solver.MaxNonlinearIterations
+        nl_tol = pars.Solver.NonlinearTolerance
+        rank = self.mesh.comm.rank
+
+        nl_error = np.inf
+        wk_error = np.inf if self.windkessels else 0.0
+        res_norm = np.inf
+        residuals = []
+        it = 0
+        converged = False
+
+        while it < max_nl_iter:
+            if verbose and rank == 0:
+                print(f"  [Newton] Nonlinear iteration {it:d}", flush=True)
+
+            # The stabilization is frozen on `up`, so track the current iterate with it
+            self.up.x.array[:] = self.u_h.x.array
+
+            # Update the outlet models from the current iterate
+            if self.windkessels is not None:
+                for wksl in self.windkessels:
+                    wksl.update(self.u_h, verbose=verbose)
+                self._refresh_impedances()
+
+            b = self._assemble_newton_system()
+            res_norm = b.norm()
+            residuals.append(res_norm)
+
+            operator = self._newton_operator if self._newton_operator is not None else self.A
+            self.ksp.setOperators(operator, self.A)
+            self.ksp.solve(b, self.dx_vec)
+
+            reason = self.ksp.getConvergedReason()
+            if reason < 0:
+                b.destroy()
+                raise RuntimeError(
+                    f"linear solve diverged at step {n_time} iteration {it} (KSPConvergedReason={reason})"
+                )
+
+            # Newton update: the shifted right-hand side above means the correction is
+            # subtracted, not added
+            self.u_h.x.array[:] -= self.du_h.x.array
+            self.p_h.x.array[:] -= self.dp_h.x.array
+            self.u_h.x.scatter_forward()
+            self.p_h.x.scatter_forward()
+
+            # Relative size of the correction, the same measure the Picard path reports
+            nl_error = self._relative_velocity_change(self.up)
+
+            if self.windkessels is not None:
+                wk_error = max(w.residual() for w in self.windkessels)
+                for wksl in self.windkessels:
+                    wksl.Pd_nl_prev = wksl.Pd_nl
+
+            if verbose and rank == 0:
+                print(f"      Nonlinear error: {nl_error:.2e}  residual: {res_norm:.2e}", flush=True)
+
+            b.destroy()
+            it += 1
+            if not np.isfinite(nl_error) or not np.isfinite(res_norm):
+                break
+            if nl_error < nl_tol and wk_error < nl_tol:
+                converged = True
+                break
+
+        return {
+            "iterations": it,
+            "nl_error": nl_error,
+            "wk_error": wk_error,
+            "residual": res_norm,
+            "residuals": residuals,
+            "converged": converged,
+            "method": "newton",
+        }
+
+    # Advance one time step
+    def step(self, n_time, t, verbose=True, pre_step=None):
+        """
+        Picard on the first time level, Newton afterwards, falling back to Picard for any step Newton cannot converge.
+
+        The previous time levels are rolled forward only once a step has actually converged, so a fallback genuinely redoes the same step rather than advancing on a failed one.
+        """
+        if pre_step is not None:
+            pre_step(self, n_time, t)
+
+        self._update_inlet(n_time, t)
+
+        if n_time == 0:
+            # No previous solution to start Newton from
+            info = self._oseen_step(n_time, verbose=verbose)
+        else:
+            info = self._newton_step(n_time, verbose=verbose)
+            if not info["converged"]:
+                if verbose and self.mesh.comm.rank == 0:
+                    print(
+                        f"  [Newton] did not converge in {info['iterations']} iterations; "
+                        "redoing the step with Picard",
+                        flush=True,
+                    )
+                # Restart from the last converged state rather than from the failed iterate
+                self.u_h.x.array[:] = self.u0.x.array
+                self.u_h.x.scatter_forward()
+                self.up.x.array[:] = self.u0.x.array
+                newton_info = info
+                info = self._oseen_step(n_time, verbose=verbose)
+                info["newton_failed"] = True
+                info["newton_iterations"] = newton_info["iterations"]
+
+        info.setdefault("newton_failed", False)
+        self._advance_time_levels()
+        return info

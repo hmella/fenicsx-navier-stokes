@@ -49,6 +49,7 @@ from basix.ufl import element as basix_element
 from dolfinx.fem import Function, functionspace
 
 from fenicsx_navier_stokes import (
+    NewtonNSProblem,
     ParameterHandler,
     PicardNSProblem,
     drag_lift_coefficients,
@@ -57,6 +58,12 @@ from fenicsx_navier_stokes import (
     evaluate_at_points,
     mass_balance,
 )
+
+# Nonlinear solver choice. Picard is the default: it is what the results in this repository were
+# produced with, and it converges from anywhere. Newton converges quadratically once close to the
+# solution, which for a transient problem the previous time step usually provides.
+SOLVERS = {"picard": PicardNSProblem, "newton": NewtonNSProblem}
+
 
 # Geometry constants, taken from the mesh generator so the two cannot drift apart
 H, L, R = turek_mesh.H, turek_mesh.L, turek_mesh.R
@@ -112,6 +119,8 @@ def main(argv=None):
     p.add_argument("--store-after", type=int, default=None,
                    help="first step to write to XDMF; omit to write no fields at all")
     p.add_argument("--store-every", type=int, default=10, help="write every n-th step")
+    p.add_argument("--solver", default="picard", choices=sorted(SOLVERS),
+                   help="nonlinear solver: picard (default, robust) or newton (faster near the solution)")
     p.add_argument("--quiet", action="store_true")
     args = p.parse_args(argv)
 
@@ -138,11 +147,11 @@ def main(argv=None):
     VE = basix_element("Lagrange", mesh.topology.cell_name(), degree, shape=(2,))
     inflow = parabolic_inflow(functionspace(mesh, VE), case["u_max"])
 
-    problem = PicardNSProblem(parameters=pars, mesh=mesh,
-                              XDMF=args.store_after is not None,
-                              domains=cell_tags, boundaries=facet_tags,
-                              element=args.element, dt=args.dt, num_steps=num_steps,
-                              inlet_profile=inflow, inlet_scale=scale)
+    problem = SOLVERS[args.solver](parameters=pars, mesh=mesh,
+                                   XDMF=args.store_after is not None,
+                                   domains=cell_tags, boundaries=facet_tags,
+                                   element=args.element, dt=args.dt, num_steps=num_steps,
+                                   inlet_profile=inflow, inlet_scale=scale)
 
     # Mean inflow velocity, used to non-dimensionalise the forces
     u_bar = 2.0 / 3.0 * case["u_max"]

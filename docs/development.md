@@ -55,6 +55,7 @@ Always pass `-u "$(id -u):$(id -g)"`. Without it the container runs as root and 
 ## Defects fixed while packaging this code (do not reintroduce)
 
 - **`A11_star` staleness.** The PSPG (1,1) block depends on the iterate through `tau_M` and must be re-assembled every nonlinear iteration. Treating it as constant leaves it at its `tau_M(up = 0)` value, so the continuity row stops weighting a single consistent strong residual. The effect is masked at small time steps, where the transient term of `tau_M` dominates, and shows up on the physical cases where the convective term is comparable.
+- **PETSc options are global.** Every problem instance takes its own `ns<N>_` options prefix; without one, two problems in the same process silently share solver settings.
 - SUPG momentum block carried `rho²` while its RHS counterpart carried `rho` — inconsistent at any `rho != 1`. Caught by the patch test **on a perturbed mesh only**: on a structured mesh `tau_M` is constant per cell and the error telescopes away.
 - `tau_M` viscous term used `Ck*mu²/h⁴` (dimensionally wrong) → `Ck*(mu/(rho*h²))²`.
 - Windkessel residual divided by `Pd`, which is exactly 0 at cold start → `nan`, and `nan > tol` is False, silently dropping the criterion. Now `|ΔPd|/(P_ATOL + |Pd|)`.
@@ -71,6 +72,8 @@ Always pass `-u "$(id -u):$(id -g)"`. Without it the container runs as root and 
 
 ## Measured results (regenerate with `make test-slow`)
 
+- Newton's Jacobian against finite differences: relative error falls linearly with the step, 4.007e-05 → 4.023e-09, then round-off. That linear scaling is the proof it is exact.
+- **Picard is faster than Newton on the aorta as configured.** 250 steps through systole, 8 ranks each: Picard 523 iterations / 2522 s, Newton 516 / 3289 s. Both converge in **2 iterations** on 240 of 250 steps, so Newton saves 1.3% of iterations while costing 32% more per iteration (6.37 s against 4.82 s). The cause is `NonlinearTolerance: 1.0e-2` with `dt = 8e-4`: there is almost no nonlinear work to save. Newton wins during the start-up transient from rest (steps 1-4: 3,3,3 against 7,5,4) and on genuinely harder problems -- 29% faster on a 2D 60x60 case at `Re ~ 1000`. Do not generalise from a short run near `t = 0`; a four-step measurement suggested Newton was 37% faster and that was an artefact of the transient.
 - MMS at `rho=1.06`, 8/16/32 crossed: L²(u) rate **2.00**, H¹(u) **1.06**, L²(p) 3.08 (pre-asymptotic). P2-P1: 3 and 2.
 - Inlet profile vs modified-Bessel shape factor: error ≤0.011 for `beta ≤ 13.3` on a 90k-cell graded cylinder; `beta = 40` needs ~290k cells.
 - Aorta 11 mm (640k tets, iterative solver): ~18 KSP iterations, ~113 s/step serial.

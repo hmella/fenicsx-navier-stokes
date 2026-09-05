@@ -49,12 +49,19 @@ from dolfinx.fem import Constant
 from petsc4py import PETSc
 
 from fenicsx_navier_stokes import (
+    NewtonNSProblem,
     ParameterHandler,
     PicardNSProblem,
     Windkessel,
     divergence_norm,
     mass_balance,
 )
+
+# Nonlinear solver choice. Picard is the default: it is what the results in this repository were
+# produced with, and it converges from anywhere. Newton converges quadratically once close to the
+# solution, which for a transient problem the previous time step usually provides.
+SOLVERS = {"picard": PicardNSProblem, "newton": NewtonNSProblem}
+
 
 # CGS pressure (barye, dyn/cm^2) per mmHg
 BARYE_PER_MMHG = 1333.22
@@ -215,6 +222,8 @@ def main(argv=None):
                    help="first step to write to XDMF; omit to write no fields at all")
     p.add_argument("--store-every", type=int, default=10,
                    help="write every n-th step; a full run is 12000 steps, so keep this high")
+    p.add_argument("--solver", default="picard", choices=sorted(SOLVERS),
+                   help="nonlinear solver: picard (default, robust) or newton (faster near the solution)")
     p.add_argument("--quiet", action="store_true")
     args = p.parse_args(argv)
 
@@ -229,11 +238,11 @@ def main(argv=None):
     windkessels = build_windkessels(pars, mesh, facet_tags, dt)
 
     # Assemble the problem. The inlet profile is computed from the geometry of the cap itself rather than assumed to be round, since a segmented aortic root is not.
-    problem = PicardNSProblem(parameters=pars, mesh=mesh,
-                              XDMF=args.store_after is not None,
-                              domains=cell_tags, boundaries=facet_tags,
-                              windkessels=windkessels, element=args.element,
-                              inlet_plateau_lam=args.plateau_lam)
+    problem = SOLVERS[args.solver](parameters=pars, mesh=mesh,
+                                   XDMF=args.store_after is not None,
+                                   domains=cell_tags, boundaries=facet_tags,
+                                   windkessels=windkessels, element=args.element,
+                                   inlet_plateau_lam=args.plateau_lam)
 
     # Run, logging diagnostics as we go. The try/finally makes sure the CSV is closed even if the run is interrupted.
     out = Path(args.output)

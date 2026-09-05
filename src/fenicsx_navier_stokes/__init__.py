@@ -28,7 +28,7 @@ from .postprocess import (
     flow_rate,
     mass_balance,
 )
-from .problems import BaseProblem, PicardNSProblem
+from .problems import BaseProblem, NewtonNSProblem, PicardNSProblem
 from .stabilization import Ck_constant, tau_C, tau_M
 
 __version__ = "0.1.0"
@@ -37,6 +37,7 @@ __all__ = [
     "BaseProblem",
     "Ck_constant",
     "DotDict",
+    "NewtonNSProblem",
     "Newtonian",
     "ParameterHandler",
     "PicardNSProblem",

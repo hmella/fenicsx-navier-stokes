@@ -40,6 +40,7 @@ from dolfinx.fem import Constant
 from petsc4py import PETSc
 
 from fenicsx_navier_stokes import (
+    NewtonNSProblem,
     ParameterHandler,
     PicardNSProblem,
     Windkessel,
@@ -47,9 +48,14 @@ from fenicsx_navier_stokes import (
     mass_balance,
 )
 
+# Nonlinear solver choice. Picard is the default: it is what the results in this repository were
+# produced with, and it converges from anywhere. Newton converges quadratically once close to the
+# solution, which for a transient problem the previous time step usually provides.
+SOLVERS = {"picard": PicardNSProblem, "newton": NewtonNSProblem}
+
 
 def build(config, radius, length, resolution, wall_resolution=None, element="P1-P1",
-          comm=None, plateau_lam=0.15):
+          comm=None, plateau_lam=0.15, solver="picard"):
     """Put together everything the solver needs: mesh, parameters and outlet models."""
     comm = comm if comm is not None else MPI.COMM_WORLD
 
@@ -82,7 +88,7 @@ def build(config, radius, length, resolution, wall_resolution=None, element="P1-
                                       P_out=Constant(mesh, PETSc.ScalarType(wk_cfg.Pd_init))))
 
     # Assemble the Navier-Stokes problem. 'inlet_plateau_lam' shapes the inlet velocity profile: small values give a flat plug, large values a parabola. 0.15 on a radius of a few centimetres is close to a plug, which is what a real vessel inlet looks like.
-    problem = PicardNSProblem(parameters=pars, mesh=mesh, XDMF=True, domains=cell_tags,
+    problem = SOLVERS[solver](parameters=pars, mesh=mesh, XDMF=True, domains=cell_tags,
                               boundaries=facet_tags, windkessels=windkessels,
                               element=element, inlet_plateau_lam=plateau_lam)
     return problem, pars, windkessels
@@ -104,6 +110,8 @@ def main(argv=None):
     p.add_argument("--store-after", type=int, default=None,
                    help="first step to write to XDMF; omit to write no fields at all")
     p.add_argument("--store-every", type=int, default=10, help="write every n-th step")
+    p.add_argument("--solver", default="picard", choices=sorted(SOLVERS),
+                   help="nonlinear solver: picard (default, robust) or newton (faster near the solution)")
     p.add_argument("--quiet", action="store_true")
     args = p.parse_args(argv)
 
@@ -112,7 +120,8 @@ def main(argv=None):
                                        args.resolution,
                                        wall_resolution=args.wall_resolution,
                                        element=args.element,
-                                       plateau_lam=args.plateau_lam, comm=comm)
+                                       plateau_lam=args.plateau_lam, comm=comm,
+                                       solver=args.solver)
 
     out = Path(args.output)
     if comm.rank == 0:

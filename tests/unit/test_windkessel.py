@@ -28,8 +28,44 @@ def make_wk(**kwargs):
     return Windkessel(**params)
 
 
+def substep_loop(wk, dt):
+    """The sub-stepping RK4 loop that ``Windkessel.RK4`` used to run, kept as the reference.
+
+    ``RK4`` now evaluates the same map in closed form, which is possible only because the flow rate is frozen across the interval and the equation is therefore linear and autonomous. This is what pins the closed form to the thing it replaced.
+    """
+    n = int(wk.Niter)
+    step = dt / n
+    Pd = wk.Pd_prev
+    for i in range(n):
+        t = i * step
+        k1 = wk.ODE(t, Pd)
+        k2 = wk.ODE(t + 0.5 * step, Pd + 0.5 * k1 * step)
+        k3 = wk.ODE(t + 0.5 * step, Pd + 0.5 * k2 * step)
+        k4 = wk.ODE(t + step, Pd + k3 * step)
+        Pd = Pd + (step / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+    return Pd
+
+
 class TestRK4:
     """The RK4 integration of the distal-pressure ODE."""
+
+    @pytest.mark.parametrize(
+        "niter, dt, Q, Pd0",
+        [
+            (1000, 8.0e-4, 120.0, 7.0e4),   # the aorta operating point
+            (100, 1.0e-2, 1.0, 0.0),        # the tube case
+            (4, 0.3, 2.0, 0.5),             # deliberately coarse, large truncation error
+            (2, 5.0e-2, -5.0, 1.0e3),       # reverse flow, two sub-steps
+        ],
+    )
+    def test_closed_form_reproduces_the_substep_loop(self, niter, dt, Q, Pd0):
+        """The closed form is the loop, not an approximation to it.
+
+        RK4 applied to ``y' = -lambda (y - y_inf)`` is the affine map ``y <- y_inf + A (y - y_inf)`` with ``A`` the stability polynomial, so n sub-steps are exactly ``A**n``. Anything that broke that identity -- a wrong Horner coefficient, a sign, the wrong power -- would show up here even where the truncation error is large, which is why the coarse cases are included.
+        """
+        wk = make_wk(Pd_prev=Pd0, Q_out=Q, Niter=niter, dt_sim=dt)
+        wk.RK4([0.0, dt])
+        assert wk.Pd_nl == pytest.approx(substep_loop(wk, dt), rel=1.0e-13)
 
     def test_constant_Q_matches_exponential(self):
         """With Q held constant the ODE is linear and has a closed-form solution."""

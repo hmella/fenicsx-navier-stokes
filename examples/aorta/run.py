@@ -132,6 +132,12 @@ class Diagnostics:
                # The pointwise mass error. Unlike mass_defect, which is exact by construction here, this one genuinely measures solution quality.
                "div_norm": divergence_norm(problem.u_h),
                "picard_iterations": info["iterations"],
+               # Krylov iterations summed over the step, and the worst single solve. These are
+               # the metric for any change to the linear solver: a preconditioner that is
+               # cheaper per application is only a win if this does not grow to match.
+               "linear_iterations": info.get("linear_iterations", 0),
+               "linear_iterations_max": info.get("linear_iterations_max", 0),
+               "ksp_reason": info.get("ksp_reason", 0),
                "nl_error": info["nl_error"],
                "wk_error": info["wk_error"],
                "converged": int(info["converged"]),
@@ -180,6 +186,14 @@ class Diagnostics:
         print(f"  Picard iterations        : "
               f"{min(r['picard_iterations'] for r in self.rows)}-"
               f"{max(r['picard_iterations'] for r in self.rows)}")
+        lin = [r["linear_iterations"] for r in self.rows]
+        picard = [r["picard_iterations"] for r in self.rows]
+        if any(lin):
+            print(f"  Krylov iterations/solve  : "
+                  f"{sum(lin) / max(sum(picard), 1):.1f} mean, "
+                  f"{max(r['linear_iterations_max'] for r in self.rows)} worst")
+        print(f"  mean wall time per step  : "
+              f"{sum(r['wall_time'] for r in self.rows) / len(self.rows):.2f} s")
         n_bad = sum(1 for r in self.rows if not r["converged"])
         if n_bad:
             print(f"  [warn] {n_bad} step(s) did not reach the nonlinear tolerance")

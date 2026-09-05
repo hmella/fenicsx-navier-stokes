@@ -76,7 +76,13 @@ class TestAxpyShortcut:
         from fenicsx_navier_stokes.constitutive import eps
 
         dxm = problem.dx
-        a00 = rho / dt * inner(1.5 * u, v) * dxm + 2 * mu * inner(eps(u), eps(v)) * dxm
+        # This has to mirror the solver's constant block exactly. Besides the BDF2 mass and
+        # viscous terms it carries grad-div: tau_C is 0.4*mu/rho, with no dependence on the
+        # iterate or on the element size, so it belongs with the constant part rather than
+        # being re-assembled every nonlinear iteration.
+        a00 = (rho / dt * inner(1.5 * u, v) * dxm
+               + 2 * mu * inner(eps(u), eps(v)) * dxm
+               + problem.tau_C * rho * div(u) * div(v) * dxm)
         a01 = -p * div(v) * dxm
         a10 = -q * div(u) * dxm
 

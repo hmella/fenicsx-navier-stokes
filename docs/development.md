@@ -76,7 +76,46 @@ Always pass `-u "$(id -u):$(id -g)"`. Without it the container runs as root and 
 - **Picard is faster than Newton on the aorta as configured.** 250 steps through systole, 8 ranks each: Picard 523 iterations / 2522 s, Newton 516 / 3289 s. Both converge in **2 iterations** on 240 of 250 steps, so Newton saves 1.3% of iterations while costing 32% more per iteration (6.37 s against 4.82 s). The cause is `NonlinearTolerance: 1.0e-2` with `dt = 8e-4`: there is almost no nonlinear work to save. Newton wins during the start-up transient from rest (steps 1-4: 3,3,3 against 7,5,4) and on genuinely harder problems -- 29% faster on a 2D 60x60 case at `Re ~ 1000`. Do not generalise from a short run near `t = 0`; a four-step measurement suggested Newton was 37% faster and that was an artefact of the transient.
 - MMS at `rho=1.06`, 8/16/32 crossed: L²(u) rate **2.00**, H¹(u) **1.06**, L²(p) 3.08 (pre-asymptotic). P2-P1: 3 and 2.
 - Inlet profile vs modified-Bessel shape factor: error ≤0.011 for `beta ≤ 13.3` on a 90k-cell graded cylinder; `beta = 40` needs ~290k cells.
-- Aorta 11 mm (640k tets, iterative solver): ~18 KSP iterations, ~113 s/step serial.
+- Aorta 11 mm (643k tets, iterative solver): ~113 s/step serial before the performance work; see the Performance section for the current parallel numbers.
+
+## Performance (aorta, 8 ranks, 643k tets / 445k dofs)
+
+Regenerate the profile with `make profile STEPS=30 NP=8`; the `fxns_*` events and the `fxns_time_loop` stage in `output/profile.txt` are what to read.
+
+**Where the time goes now** (30 steps, per cent of the time-loop stage):
+
+| phase | share |
+|---|---|
+| `fxns_assemble_A` — the four Jacobian/Oseen blocks | 59% |
+| `KSPSolve` | 21% |
+| `fxns_assemble_b` — the right-hand side | 15% |
+| `PCSetUp` + `PCSetUpOnBlocks` | 3.5% |
+| `fxns_callback` — the diagnostics | 0.9% |
+
+**Assembly, not the linear solver, is now the bottleneck.** Before the solver work it was the other way round: `KSPSolve` was 31% and two BoomerAMG hierarchies were rebuilt on every nonlinear iteration for another 13%. Anyone continuing this should start from `fxns_assemble_A`.
+
+**Measured effect of each change** (100 steps, production configuration, against the code at the commit before this work):
+
+| | s/step | s/nonlinear iteration |
+|---|---|---|
+| baseline | 8.01 | 4.01 |
+| solver options + preconditioner reuse | 4.45 | 2.22 |
+| plus quadrature degree 3 | see `make profile` | |
+
+The Picard iteration histogram is unchanged (90 of 100 steps take exactly two iterations, in both).
+
+**These changes do not alter the solution.** Verified by running both codes at `NonlinearTolerance: 1e-6` and `SolverATol: 1e-12` for 20 steps: every outlet flow, flow split, pressure and the divergence norm agree to **6.4e-6**, i.e. to the nonlinear tolerance. At the production `NonlinearTolerance: 1.0e-2` the same comparison shows up to **6%** difference in outlet pressures — that is the sensitivity of stopping the Picard iteration at a 1% relative change, not an effect of any of these changes, and it is worth knowing before treating two aorta runs as comparable.
+
+### Things that were tried and did not work
+
+- **`pc_fieldsplit_schur_precondition a11`.** Tempting, because PSPG puts a `tau_M`-weighted pressure Laplacian in the (1,1) block and Cahouet–Chabard says that is the right Schur preconditioner at this operating point (`rho*1.5/dt ~ 2000` against a viscous `mu/h^2 ~ 16`). It diverges on the first solve (`KSP_DIVERGED_DTOL`): that block is a pure-Neumann Laplacian, singular on constants, where `selfp`'s approximation is not. A non-singular variant would shift it by a pressure mass matrix.
+- **A Cauchy-in-`dt` study of the temporal order.** Invalid for this scheme: `tau_M` contains `(sigma/dt)^2`, and the transient term accounts for 99.7% of it at the settings tested, so `tau_M` is proportional to `dt` and refining the time step changes the *spatial* stabilization too. Run on the Picard scheme, which should show a clean BDF2 rate, it measures 0.72.
+
+### Tolerances: check which one is binding
+
+`SolverRTol` and `SolverATol` are both in play and the absolute one wins more often than expected. On the aorta **every accepted solve stops on `CONVERGED_ATOL`**, so `SolverRTol: 1.0e-8` is decoration and changing it does nothing. The `ksp_reason` column in the diagnostics CSV records this (2 = ATOL, 3 = RTOL); read it before tuning either.
+
+The same effect bit the tube verification case. `mass_balance` is a near-total cancellation of `Q_in` against the outflows, so it amplifies whatever residual the linear solve leaves behind, and the old configuration passed its `< 1e-6` assertion only because a zero initial guess made every solve overshoot well past its tolerance. With a nonzero initial guess the solve stops where it is told to, `SolverATol: 1.0e-10` binds first, and the defect rises to 6.7e-6. Tightening both tolerances for that case (it is 6k cells and half a second a step) puts it at 2.4e-9, twenty times better than the original.
 
 ## Not covered (and why)
 

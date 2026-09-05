@@ -43,6 +43,12 @@ ENV PYTHONPATH=/work/src:/usr/local/dolfinx-real/lib/python3.12/dist-packages:/u
 # directories inside the mounted tree cannot be removed by the host user afterwards.
 ENV PYTHONDONTWRITEBYTECODE=1
 
+# One thread per MPI rank. The parallelism here is MPI, and the runs are sized to fill the
+# machine with ranks; if a threaded BLAS or a threaded hypre also spawned a thread per core
+# then 8 ranks on 8 cores would ask for 64 threads and every timing would be meaningless.
+# The base image already pins OPENBLAS_NUM_THREADS, but not the generic OpenMP variable.
+ENV OMP_NUM_THREADS=1
+
 # FFCx compiles UFL forms to C and caches the result; matplotlib and gmsh also want a
 # writable config directory. Point all of them at world-writable locations so the image
 # works under any UID, and pre-create them so the first run does not race.

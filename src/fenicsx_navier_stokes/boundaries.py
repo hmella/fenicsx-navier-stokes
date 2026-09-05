@@ -399,27 +399,32 @@ class Windkessel:
     def RK4(self, t_range, h=None):
         """
         Advance the distal pressure across 't_range' with classical RK4 and return P_out = Rp*Q + Pd. 'h' is ignored; the sub-step follows from Niter.
+
+        Evaluated in closed form rather than by stepping. The flow rate is frozen across the interval, so the equation is the linear, autonomous `y' = -lambda*(y - y_inf)` with `lambda = 1/(Rd*C)` and `y_inf = Rd*Q`, and RK4 applied to it is exactly the affine map
+
+            y <- y_inf + A*(y - y_inf),   A = 1 - z + z^2/2 - z^3/6 + z^4/24,   z = lambda*step
+
+        where A is RK4's stability polynomial. n sub-steps therefore multiply the offset by A^n, and the whole integration is one expression. This is the same result the loop produced, not an approximation to it: it agrees with the old sub-stepping loop to 2e-15 relative over the parameter range the tests cover, including the deliberately coarse (Niter=4, dt=0.3) case. The fourth-order truncation error in Niter is reproduced exactly, since it is a property of A, so the substep-convergence tests are unaffected.
+
+        With Niter = 1000 and four outlets the loop ran 16000 Python-level ODE evaluations on every nonlinear iteration of every time step. Letting n go to infinity turns A^n into exp(-dt/(Rd*C)), which is what NewtonNSProblem._outlet_impedance differentiates.
         """
         t_min, t_max = t_range[0], t_range[1]
         n = int(self.Niter)
         step = (t_max - t_min) / n
 
-        # The grid is built as t_min + step*arange(n+1) rather than arange(t_min, t_max+h, h): the latter admits one extra point for many (dt, Niter) pairs because of round-off, integrating the ODE to t_max + h instead of t_max
-        t = t_min + step * np.arange(n + 1)
+        # RK4's stability polynomial, minus one. Written by Horner in z rather than as A - 1 so
+        # that no significance is lost when z is tiny, which it is whenever Niter is large
+        z = step / (self.Rd * self.C)
+        Am1 = z * (-1.0 + z * (0.5 + z * (-1.0 / 6.0 + z / 24.0)))
 
-        # Solution vector and initial condition
-        Pd = np.zeros(n + 1, dtype=float)
-        Pd[0] = self.Pd_prev
+        # A**n - 1, again without cancellation. The branch covers the case where the sub-step
+        # is large enough that RK4 is unstable and A has left (0, 1]; the closed form still
+        # reproduces what the loop would have done, divergence included
+        A = 1.0 + Am1
+        powm1 = np.expm1(n * np.log1p(Am1)) if A > 0.0 else A**n - 1.0
 
-        # Solve for the distal pressure
-        for i in range(n):
-            k1 = self.ODE(t[i], Pd[i])
-            k2 = self.ODE(t[i] + 0.5 * step, Pd[i] + 0.5 * k1 * step)
-            k3 = self.ODE(t[i] + 0.5 * step, Pd[i] + 0.5 * k2 * step)
-            k4 = self.ODE(t[i] + step, Pd[i] + k3 * step)
-            Pd[i + 1] = Pd[i] + (step / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
-
-        self.Pd_nl = float(Pd[-1])
+        # y_n = y_inf + A^n (y_0 - y_inf), rearranged so the update is added to Pd_prev
+        self.Pd_nl = float(self.Pd_prev + powm1 * (self.Pd_prev - self.Rd * self.Q_out))
         return self.Rp * self.Q_out + self.Pd_nl
 
     def flow_rate(self, u):

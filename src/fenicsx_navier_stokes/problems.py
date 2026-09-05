@@ -60,6 +60,27 @@ from .stabilization import tau_C, tau_M
 # BDF2 coefficient of the new time level, i.e. 3/2
 BDF2_THETA = 1.5
 
+# PETSc log events for the phases that are not themselves PETSc calls. Without them a -log_view
+# profile attributes matrix assembly, the Windkessel update and the user callback to nothing at
+# all, so roughly half the run time is invisible. Registering an event costs nothing and entering
+# one costs a few hundred nanoseconds when logging is off, so they are always on.
+_EV_ASSEMBLE_A = PETSc.Log.Event("fxns_assemble_A")
+_EV_ASSEMBLE_B = PETSc.Log.Event("fxns_assemble_b")
+_EV_WINDKESSEL = PETSc.Log.Event("fxns_windkessel")
+_EV_CONVERGENCE = PETSc.Log.Event("fxns_convergence")
+_EV_CALLBACK = PETSc.Log.Event("fxns_callback")
+_EV_IO = PETSc.Log.Event("fxns_io")
+
+# Separates the time loop from one-off setup (mesh reading, the inlet-profile solve, form
+# compilation), which would otherwise inflate every per-step percentage
+_STAGE_TIME_LOOP = PETSc.Log.Stage("fxns_time_loop")
+
+# The *_star matrices are allocated from the union of the constant and iterate-dependent forms,
+# so the constant block's pattern is a strict SUBSET of theirs. Saying so lets PETSc add them
+# without rebuilding the matrix. It must not be SAME: the constant blocks are allocated from
+# their own form with IGNORE_ZERO_ENTRIES on, so their stored pattern really is smaller.
+_SUBSET_PATTERN = PETSc.Mat.Structure.SUBSET_NONZERO_PATTERN
+
 
 # Writes PETSc options under a per-instance prefix
 class _PrefixedOptions:
@@ -437,9 +458,9 @@ class BaseProblem:
         self.A10.setOption(PETSc.Mat.Option.NEW_NONZERO_LOCATIONS, False)
 
         # Add the constant blocks onto the star blocks
-        self.A00_star.axpy(1.0, self.A00)
-        self.A01_star.axpy(1.0, self.A01)
-        self.A10_star.axpy(1.0, self.A10)
+        self.A00_star.axpy(1.0, self.A00, structure=_SUBSET_PATTERN)
+        self.A01_star.axpy(1.0, self.A01, structure=_SUBSET_PATTERN)
+        self.A10_star.axpy(1.0, self.A10, structure=_SUBSET_PATTERN)
 
         # Create nested matrix
         self.A = create_matrix(self.a, kind="nest")
@@ -467,6 +488,34 @@ class BaseProblem:
         # instance its own prefix isolates them.
         BaseProblem._ksp_counter += 1
         prefix = f"ns{BaseProblem._ksp_counter}_"
+        self._guess_nonzero = False
+        self._is_iterative = pars.Solver.Kind == "iterative"
+
+        # Preconditioner reuse policy, see _prepare_preconditioner. A refresh period of 0
+        # disables reuse and rebuilds on every solve, which is the behaviour this code had
+        # before the policy existed.
+        self._pc_period = int(getattr(pars.Solver, "PreconditionerRefresh", 5))
+        self._pc_guard = float(getattr(pars.Solver, "PreconditionerGuard", 1.5))
+        self._pc_steps_since_rebuild = 0
+        self._pc_its_at_rebuild = None
+        self._pc_last_its = 0
+        self._pc_rebuilt_this_solve = False
+
+        # Two-level linear tolerance, see _linear_rtol
+        self._rtol_final = pars.Solver.SolverRTol
+        nl_tol = pars.Solver.NonlinearTolerance
+
+        # picard (default) iterates the convection to convergence; extrapolated does one
+        # linear solve per step, see PicardNSProblem._extrapolated_step
+        self._nonlinear_scheme = getattr(pars.Solver, "NonlinearScheme", "picard")
+        if self._nonlinear_scheme not in ("picard", "extrapolated"):
+            raise ValueError(
+                f"unknown Solver.NonlinearScheme {self._nonlinear_scheme!r}; "
+                "expected 'picard' or 'extrapolated'"
+            )
+        self._rtol_first = float(
+            getattr(pars.Solver, "SolverRTolFirst", max(self._rtol_final, 0.1 * nl_tol))
+        )
         self.ksp.setOptionsPrefix(prefix)
         opts = _PrefixedOptions(prefix)
 
@@ -482,18 +531,65 @@ class BaseProblem:
             opts["ksp_gmres_restart"] = pars.Solver.SolverGMRESRestart
             opts["ksp_pc_side"] = "right"
 
+            # Start each solve from the current contents of the solution vector rather than
+            # from zero. In the Picard iteration that vector already holds the previous
+            # iterate, and on the first iteration of a step it holds the converged previous
+            # time step, which is only O(dt) away. Measured on the aorta: 20 Krylov
+            # iterations per solve down to 15.
+            #
+            # The Newton path turns this off again, because it solves for a correction and
+            # the previous correction is a poor guess for the next one.
+            self.ksp.setInitialGuessNonzero(True)
+            self._guess_nonzero = True
+
             # Define the velocity and pressure blocks of the preconditioner from the index sets of the nested matrix
             nested_IS = self.A.getNestISs()
             self.ksp.getPC().setFieldSplitIS(("u", nested_IS[0][0]), ("p", nested_IS[0][1]))
 
             opts["pc_fieldsplit_type"] = "schur"
-            opts["pc_fieldsplit_schur_fact_type"] = "lower"
-            opts["pc_fieldsplit_schur_precondition"] = "selfp"
+            opts["pc_fieldsplit_schur_fact_type"] = getattr(
+                pars.Solver, "SchurFactType", "lower"
+            )
+
+            # `selfp` builds A11 - A10 diag(A00)^-1 A01. Its stencil is roughly the square of
+            # the P1 vertex one, so it costs a sparse triple product per preconditioner setup
+            # and gives AMG a denser matrix to work on -- which is the likeliest reason the
+            # pressure block costs five times the velocity block despite having a third of the
+            # dofs.
+            #
+            # Using the (1,1) block directly is tempting, because PSPG puts a tau_M-weighted
+            # pressure Laplacian there and Cahouet-Chabard says that is the right operator at
+            # this operating point. It does not work: that block is a pure-Neumann Laplacian,
+            # singular on constants, where selfp's approximation is not, and the cold start
+            # diverges outright (KSP_DIVERGED_DTOL on the very first solve). Measured, not
+            # assumed. A non-singular variant would have to shift it by a pressure mass
+            # matrix; until someone does that, selfp stays.
+            opts["pc_fieldsplit_schur_precondition"] = getattr(
+                pars.Solver, "SchurPrecondition", "selfp"
+            )
+
+            # BoomerAMG settings for 3D. PETSc's default strong_threshold is 0.25, which is
+            # the two-dimensional value: on tetrahedra it coarsens far too slowly, giving
+            # dense hierarchies whose setup and V-cycle both cost several times what they
+            # need to. HMIS with ext+i interpolation and one level of aggressive coarsening
+            # is the standard three-dimensional recipe.
+            #
+            # Measured on the aorta at 8 ranks: 12.1 s/step down to 9.0 s/step with the
+            # Krylov iteration count unchanged at 19-21. Sweeping strong_threshold over
+            # {0.5, 0.6, 0.7} and adding interpolation truncation all landed within 2%, so
+            # this is a plateau rather than a tuned edge.
+            amg = {
+                "strong_threshold": getattr(pars.Solver, "AMGStrongThreshold", 0.5),
+                "coarsen_type": getattr(pars.Solver, "AMGCoarsenType", "HMIS"),
+                "interp_type": getattr(pars.Solver, "AMGInterpType", "ext+i"),
+                "agg_nl": getattr(pars.Solver, "AMGAggressiveLevels", 1),
+            }
             for blk in ("u", "p"):
                 opts[f"fieldsplit_{blk}_ksp_type"] = "preonly"
                 opts[f"fieldsplit_{blk}_pc_type"] = "hypre"
                 opts[f"fieldsplit_{blk}_pc_hypre_type"] = "boomeramg"
-                opts[f"fieldsplit_{blk}_pc_hypre_boomeramg_relax_weight_all"] = 0.0
+                for key, value in amg.items():
+                    opts[f"fieldsplit_{blk}_pc_hypre_boomeramg_{key}"] = value
 
         elif pars.Solver.Kind == "direct":
             # Direct LU with MUMPS: robust, and the right choice for the small 2D cases.
@@ -519,6 +615,47 @@ class BaseProblem:
         # Apply options and set up solver
         self.ksp.setFromOptions()
 
+    # Whether this solve rebuilds the preconditioner or reuses the previous one
+    def _prepare_preconditioner(self, first_of_step):
+        """
+        Reusing a preconditioner cannot change the answer. FGMRES applies the true, current operator in every matrix-vector product; the preconditioner only steers the search, so a stale one costs Krylov iterations and nothing else. That makes this the cheapest saving available, since the two BoomerAMG hierarchies are otherwise rebuilt on every nonlinear iteration and account for about an eighth of the run.
+
+        Two tiers. Within a time step the operator changes only through `up`, whose relative change is below the nonlinear tolerance by construction, so iterations after the first reuse unconditionally. Across time steps the operator drifts by O(dt) per step, so a rebuild is forced every `PreconditionerRefresh` steps, or sooner if the Krylov count has grown by more than a factor `PreconditionerGuard` since the last rebuild.
+
+        The guard is safe in parallel: KSPGetIterationNumber is collective and returns the same value on every rank, so every rank reaches the same decision. A rank-dependent one would deadlock at the next collective.
+        """
+        if not self._is_iterative or self._pc_period <= 0:
+            return
+        rebuild = False
+        if first_of_step:
+            if self._pc_its_at_rebuild is None:
+                rebuild = True  # first solve of the run
+            elif self._pc_steps_since_rebuild >= self._pc_period:
+                rebuild = True
+            elif self._pc_last_its > self._pc_guard * self._pc_its_at_rebuild:
+                rebuild = True
+        self.ksp.getPC().setReusePreconditioner(not rebuild)
+        self._pc_rebuilt_this_solve = rebuild
+        if rebuild:
+            self._pc_steps_since_rebuild = 0
+
+    # Record what the last solve cost, for the reuse guard
+    def _record_linear_iterations(self, its):
+        if self._pc_rebuilt_this_solve:
+            # The healthy cost is measured against a fresh preconditioner, not a stale one
+            self._pc_its_at_rebuild = its
+            self._pc_rebuilt_this_solve = False
+        self._pc_last_its = its
+
+    # Relative tolerance for this nonlinear iteration
+    def _linear_rtol(self, it):
+        """
+        The first nonlinear iteration is a throwaway: its only job is to supply the linearization point and tau_M for the next one, and it differs from that next iterate by O(1) relative. Solving it as tightly as the accepted iterate is wasted work, so it gets a looser tolerance -- by default a tenth of the nonlinear tolerance, which keeps it well inside the accuracy the step is aiming for, and never looser than the final tolerance.
+
+        The accepted iterate keeps the full tolerance. That matters more than it looks: nothing checks a residual afterwards, so the linear-solve error enters u_h, then the previous time levels, and accumulates over the run.
+        """
+        return self._rtol_first if it == 0 else self._rtol_final
+
     # Forms used by the convergence test, compiled once
     def _setup_convergence_forms(self):
         self._diff = Function(self.V)
@@ -539,6 +676,7 @@ class BaseProblem:
 
     # Roll the solution into the previous time levels
     def _advance_time_levels(self):
+        self._pc_steps_since_rebuild += 1
         if self.windkessels is not None:
             for wksl in self.windkessels:
                 wksl.advance()
@@ -585,6 +723,9 @@ class BaseProblem:
 
         history = []
         t = 0.0
+
+        # Pushed rather than used as a context manager so the loop body keeps its indentation
+        _STAGE_TIME_LOOP.push()
         try:
             for n_time in range(num_steps):
                 # Update time
@@ -611,7 +752,8 @@ class BaseProblem:
                     )
 
                 if callback is not None:
-                    callback(self, n_time, t, info)
+                    with _EV_CALLBACK:
+                        callback(self, n_time, t, info)
 
                 # Write to file
                 if (
@@ -619,11 +761,13 @@ class BaseProblem:
                     and n_time >= store_after
                     and (n_time - store_after) % store_every == 0
                 ):
-                    file_u.write_function(self.u_h, t)
-                    file_u.flush()
-                    file_p.write_function(self.p_h, t)
-                    file_p.flush()
+                    with _EV_IO:
+                        file_u.write_function(self.u_h, t)
+                        file_u.flush()
+                        file_p.write_function(self.p_h, t)
+                        file_p.flush()
         finally:
+            _STAGE_TIME_LOOP.pop()
             # Close files
             if file_u is not None:
                 file_u.close()
@@ -675,7 +819,13 @@ class PicardNSProblem(BaseProblem):
         # Variational formulation (Galerkin part)
         # ---------------------------------------------------------------------------------
         a00_conv = rho * inner(grad(u) * self.up, v) * dx
-        a00 = rho / dt * inner(BDF2_THETA * u, v) * dx + 2 * mu * inner(eps(u), eps(v)) * dx
+        # The grad-div term joins the mass and viscous terms in the constant block: tau_C is
+        # 0.4*mu/rho, a product of two Constants with no dependence on the iterate or on the
+        # element size, so re-assembling it on every nonlinear iteration only ever reproduced
+        # the same numbers. The assembled system is unchanged.
+        a00 = (rho / dt * inner(BDF2_THETA * u, v) * dx
+               + 2 * mu * inner(eps(u), eps(v)) * dx
+               + tC * rho * div(u) * div(v) * dx)
         a01 = -p * div(v) * dx
         a10 = -q * div(u) * dx
         L0 = rho / dt * inner(2 * self.u0 - 0.5 * self.u00, v) * dx
@@ -704,11 +854,11 @@ class PicardNSProblem(BaseProblem):
         if self.f is not None:
             res_rhs = res_rhs + self.f
 
-        # Momentum row: streamline weight (up.grad)v against the residual, plus grad-div
+        # Momentum row: streamline weight (up.grad)v against the residual. The grad-div term
+        # that used to live here is now in a00, since it does not depend on the iterate
         a_SUPG_00 = tM * inner(grad(v) * self.up, res_lhs) * dx
         if self.supg_viscous:
             a_SUPG_00 += tM * mu * inner(nabla_grad(grad(v) * self.up), nabla_grad(u)) * dx
-        a_SUPG_00 += tC * rho * div(u) * div(v) * dx
 
         # Pressure gradient in the momentum row (SUPG part)
         a_SUPG_01 = tM * inner(grad(p), grad(v) * self.up) * dx
@@ -737,41 +887,47 @@ class PicardNSProblem(BaseProblem):
         self._f_a10_star = form(self.a10_star)
         self._f_a11_star = form(self.a11_star)
 
+        # Per-block boundary-condition lists. dolfinx wants the conditions grouped by function
+        # space, and that grouping depends only on the forms, so it is done once here rather
+        # than twice on every nonlinear iteration.
+        self._bcs_lift = bcs_by_block(extract_function_spaces(self.a), self.bcs)
+        self._bcs_set = bcs_by_block(extract_function_spaces(self.L), self.bcs)
+
         return a00, a01, a10
 
     # Re-assemble the iteration-dependent blocks and the right-hand side
     def _assemble_system(self):
-        # Assemble right-hand side vector
-        b = assemble_vector(self.L, kind="nest")
+        with _EV_ASSEMBLE_B:
+            # Assemble right-hand side vector
+            b = assemble_vector(self.L, kind="nest")
 
-        # Modify ('lift') the RHS for the Dirichlet boundary conditions
-        bcs1 = bcs_by_block(extract_function_spaces(self.a), self.bcs)
-        apply_lifting(b, self.a, bcs=bcs1)
+            # Modify ('lift') the RHS for the Dirichlet boundary conditions
+            apply_lifting(b, self.a, bcs=self._bcs_lift)
 
-        # Sum contributions for entries shared across parallel processes
-        for b_sub in b.getNestSubVecs():
-            b_sub.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+            # Sum contributions for entries shared across parallel processes
+            for b_sub in b.getNestSubVecs():
+                b_sub.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
 
-        # Set the Dirichlet values in the RHS vector
-        bcs0 = bcs_by_block(extract_function_spaces(self.L), self.bcs)
-        set_bc(b, bcs0)
+            # Set the Dirichlet values in the RHS vector
+            set_bc(b, self._bcs_set)
 
-        # Re-assemble convection and stabilization, then add the stored constant blocks back
-        for A_star, f_star, A_const in ((self.A00_star, self._f_a00_star, self.A00),
-                                        (self.A01_star, self._f_a01_star, self.A01),
-                                        (self.A10_star, self._f_a10_star, self.A10)):
-            A_star.zeroEntries()
-            assemble_matrix(A_star, f_star, bcs=self.bcs, diag=0.0)
-            A_star.assemble()
-            A_star.axpy(1.0, A_const)
+        with _EV_ASSEMBLE_A:
+            # Re-assemble convection and stabilization, then add the stored constant blocks back
+            for A_star, f_star, A_const in ((self.A00_star, self._f_a00_star, self.A00),
+                                            (self.A01_star, self._f_a01_star, self.A01),
+                                            (self.A10_star, self._f_a10_star, self.A10)):
+                A_star.zeroEntries()
+                assemble_matrix(A_star, f_star, bcs=self.bcs, diag=0.0)
+                A_star.assemble()
+                A_star.axpy(1.0, A_const, structure=_SUBSET_PATTERN)
 
-        # The (1,1) block has no constant counterpart, but it is iterate-dependent through tau_M
-        # and must be refreshed too
-        self.A11_star.zeroEntries()
-        assemble_matrix(self.A11_star, self._f_a11_star, bcs=self.bcs, diag=1.0)
-        self.A11_star.assemble()
+            # The (1,1) block has no constant counterpart, but it is iterate-dependent through
+            # tau_M and must be refreshed too
+            self.A11_star.zeroEntries()
+            assemble_matrix(self.A11_star, self._f_a11_star, bcs=self.bcs, diag=1.0)
+            self.A11_star.assemble()
 
-        self.A.assemble()
+            self.A.assemble()
         return b
 
     # Picard-iterate to convergence at the current time level
@@ -788,6 +944,7 @@ class PicardNSProblem(BaseProblem):
         wk_error = np.inf if self.windkessels else 0.0
         it = 0
         converged = False
+        lin_its, lin_its_max, reason = 0, 0, 0
 
         # Nonlinear iterations
         while it < max_nl_iter:
@@ -796,28 +953,40 @@ class PicardNSProblem(BaseProblem):
 
             # Update the windkessels from the current iterate
             if self.windkessels is not None:
-                for wksl in self.windkessels:
-                    wksl.update(self.up, verbose=verbose)
+                with _EV_WINDKESSEL:
+                    for wksl in self.windkessels:
+                        wksl.update(self.up, verbose=verbose)
 
             # Assemble and solve
             b = self._assemble_system()
             self.ksp.setOperators(self.A)
+            self.ksp.setInitialGuessNonzero(self._guess_nonzero)
+            if self._is_iterative:
+                self.ksp.setTolerances(rtol=self._linear_rtol(it))
+            self._prepare_preconditioner(first_of_step=(it == 0))
             self.ksp.solve(b, self.x)
             self.u_h.x.scatter_forward()
             self.p_h.x.scatter_forward()
 
+            # Linear-solver diagnostics. getIterationNumber is collective and returns the same
+            # value on every rank, so recording it needs no reduction
+            its = self.ksp.getIterationNumber()
+            lin_its += its
+            lin_its_max = max(lin_its_max, its)
+            self._record_linear_iterations(its)
             reason = self.ksp.getConvergedReason()
             if reason < 0:
                 raise RuntimeError(
                     f"linear solve diverged at step {n_time} iteration {it} (KSPConvergedReason={reason})"
                 )
 
-            # Relative L2 error between successive Picard iterates
-            nl_error = self._relative_velocity_change(self.up)
+            with _EV_CONVERGENCE:
+                # Relative L2 error between successive Picard iterates
+                nl_error = self._relative_velocity_change(self.up)
 
-            # Windkessel convergence measure
-            if self.windkessels is not None:
-                wk_error = max(w.residual() for w in self.windkessels)
+                # Windkessel convergence measure
+                if self.windkessels is not None:
+                    wk_error = max(w.residual() for w in self.windkessels)
 
             # Update the iterate
             self.up.x.array[:] = self.u_h.x.array
@@ -826,7 +995,8 @@ class PicardNSProblem(BaseProblem):
                     wksl.Pd_nl_prev = wksl.Pd_nl
 
             if verbose and rank == 0:
-                print(f"      Nonlinear error: {nl_error:.2e}", flush=True)
+                print(f"      Nonlinear error: {nl_error:.2e}"
+                      f"  ({its:d} linear iterations)", flush=True)
                 if self.windkessels is not None:
                     print(f"      Windkessel iteration error: {wk_error:.2e}", flush=True)
 
@@ -842,6 +1012,76 @@ class PicardNSProblem(BaseProblem):
             "wk_error": wk_error,
             "converged": converged,
             "method": "picard",
+            "linear_iterations": lin_its,
+            "linear_iterations_max": lin_its_max,
+            "ksp_reason": int(reason),
+        }
+
+    # One linear solve per step, with the convection extrapolated instead of iterated
+    def _extrapolated_step(self, n_time, verbose=True):
+        """
+        Linearizes the convection about `2 u^n - u^{n-1}` and solves once, with no nonlinear iteration at all.
+
+        This is not "stop the Picard iteration after one sweep". That sweep linearizes about `u^n`, a first-order extrapolation, which would drop the whole scheme to O(dt) in the convective term. `2 u^n - u^{n-1}` is second-order and therefore consistent with the BDF2 time derivative, and the resulting scheme is a standard semi-implicit one.
+
+        On the aorta as configured, 990 of the 1000 steps of a cardiac cycle take exactly two Picard iterations, so removing the iteration is worth close to a factor of two. What it costs is the fixed point: the convection and the stabilization are evaluated at an extrapolated velocity rather than at the solution, so this is a different discretization, not a cheaper route to the same one. It stays off by default for that reason.
+
+        `tau_M`, the SUPG weight and the backflow term all read `up`, so setting `up` once here keeps every one of them on the same extrapolated field. Splitting that -- freezing some terms and not others -- is what made the PSPG block inconsistent once before.
+
+        The Windkessel coupling becomes fully lagged, driven by the extrapolated flow rate. That matches what the coupling already is: it is first order in dt regardless, because the flow rate is frozen across the step.
+        """
+        rank = self.mesh.comm.rank
+
+        # Second-order extrapolation of the velocity to the new time level
+        self.up.x.array[:] = 2.0 * self.u0.x.array - self.u00.x.array
+        self.up.x.scatter_forward()
+
+        if self.windkessels is not None:
+            with _EV_WINDKESSEL:
+                for wksl in self.windkessels:
+                    wksl.update(self.up, verbose=verbose)
+
+        b = self._assemble_system()
+        self.ksp.setOperators(self.A)
+        self.ksp.setInitialGuessNonzero(self._guess_nonzero)
+        if self._is_iterative:
+            self.ksp.setTolerances(rtol=self._rtol_final)
+        self._prepare_preconditioner(first_of_step=True)
+        self.ksp.solve(b, self.x)
+        self.u_h.x.scatter_forward()
+        self.p_h.x.scatter_forward()
+
+        its = self.ksp.getIterationNumber()
+        self._record_linear_iterations(its)
+        reason = self.ksp.getConvergedReason()
+        b.destroy()
+        if reason < 0:
+            raise RuntimeError(
+                f"linear solve diverged at step {n_time} (KSPConvergedReason={reason})"
+            )
+
+        # There is no nonlinear iteration, so the natural error measure is how far the
+        # extrapolation was from the solution it produced. It is reported, not tested against
+        # a tolerance: a large value means dt is too big for the extrapolation, which is a
+        # statement about the time step rather than about convergence.
+        nl_error = self._relative_velocity_change(self.up)
+        if self.windkessels is not None:
+            for wksl in self.windkessels:
+                wksl.Pd_nl_prev = wksl.Pd_nl
+
+        if verbose and rank == 0:
+            print(f"  [Extrapolated] Extrapolation error: {nl_error:.2e}"
+                  f"  ({its:d} linear iterations)", flush=True)
+
+        return {
+            "iterations": 1,
+            "nl_error": nl_error,
+            "wk_error": 0.0,
+            "converged": True,
+            "method": "extrapolated",
+            "linear_iterations": its,
+            "linear_iterations_max": its,
+            "ksp_reason": int(reason),
         }
 
     # Advance one time step by Picard-iterating to convergence
@@ -853,7 +1093,14 @@ class PicardNSProblem(BaseProblem):
             pre_step(self, n_time, t)
 
         self._update_inlet(n_time, t)
-        info = self._oseen_step(n_time, verbose=verbose)
+
+        # The extrapolation needs two distinct previous levels. At the first step u^n and
+        # u^{n-1} are the same initial condition, so it degenerates to u^n and there is
+        # nothing to gain; Picard also handles the cold start, which is where it is needed.
+        if self._nonlinear_scheme == "extrapolated" and n_time > 0:
+            info = self._extrapolated_step(n_time, verbose=verbose)
+        else:
+            info = self._oseen_step(n_time, verbose=verbose)
         self._advance_time_levels()
         return info
 
@@ -1013,6 +1260,10 @@ class NewtonNSProblem(PicardNSProblem):
         self._J_form = form([[j00, j01], [j10, j11]])
         self._f_j00, self._f_j01 = form(j00), form(j01)
         self._f_j10, self._f_j11 = form(j10), form(j11)
+
+        # Per-block boundary-condition lists, cached for the same reason as the Oseen ones
+        self._bcs_lift_newton = bcs_by_block(extract_function_spaces(self._J_form), self.bcs)
+        self._bcs_set_newton = bcs_by_block(extract_function_spaces(self._F_form), self.bcs)
         return j00, j01, j10
 
     # Cap vectors and impedances for the exact outlet coupling
@@ -1087,30 +1338,30 @@ class NewtonNSProblem(PicardNSProblem):
         """
         # self.x is the nest wrapping u_h and p_h, i.e. the current iterate. The lifting
         # and boundary helpers take the nest itself and split it internally.
-        b = assemble_vector(self._F_form, kind="nest")
-        bcs1 = bcs_by_block(extract_function_spaces(self._J_form), self.bcs)
-        apply_lifting(b, self._J_form, bcs=bcs1, x0=self.x, alpha=-1)
-        for b_sub in b.getNestSubVecs():
-            b_sub.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
-        bcs0 = bcs_by_block(extract_function_spaces(self._F_form), self.bcs)
-        set_bc(b, bcs0, x0=self.x, alpha=-1)
+        with _EV_ASSEMBLE_B:
+            b = assemble_vector(self._F_form, kind="nest")
+            apply_lifting(b, self._J_form, bcs=self._bcs_lift_newton, x0=self.x, alpha=-1)
+            for b_sub in b.getNestSubVecs():
+                b_sub.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+            set_bc(b, self._bcs_set_newton, x0=self.x, alpha=-1)
 
         # Jacobian. Unlike the Picard path there is no constant-plus-axpy split: every
         # block depends on the iterate, so each is assembled whole.
-        for A_blk, f_blk, square in (
-            (self.A00_star, self._f_j00, True),
-            (self.A01_star, self._f_j01, False),
-            (self.A10_star, self._f_j10, False),
-            (self.A11_star, self._f_j11, True),
-        ):
-            A_blk.zeroEntries()
-            if square:
-                assemble_matrix(A_blk, f_blk, bcs=self.bcs, diag=1.0)
-            else:
-                assemble_matrix(A_blk, f_blk, bcs=self.bcs)
-            A_blk.assemble()
+        with _EV_ASSEMBLE_A:
+            for A_blk, f_blk, square in (
+                (self.A00_star, self._f_j00, True),
+                (self.A01_star, self._f_j01, False),
+                (self.A10_star, self._f_j10, False),
+                (self.A11_star, self._f_j11, True),
+            ):
+                A_blk.zeroEntries()
+                if square:
+                    assemble_matrix(A_blk, f_blk, bcs=self.bcs, diag=1.0)
+                else:
+                    assemble_matrix(A_blk, f_blk, bcs=self.bcs)
+                A_blk.assemble()
 
-        self.A.assemble()
+            self.A.assemble()
         return b
 
     # Newton-iterate to convergence at the current time level
@@ -1126,6 +1377,7 @@ class NewtonNSProblem(PicardNSProblem):
         residuals = []
         it = 0
         converged = False
+        lin_its, lin_its_max, reason = 0, 0, 0
 
         while it < max_nl_iter:
             if verbose and rank == 0:
@@ -1136,9 +1388,10 @@ class NewtonNSProblem(PicardNSProblem):
 
             # Update the outlet models from the current iterate
             if self.windkessels is not None:
-                for wksl in self.windkessels:
-                    wksl.update(self.u_h, verbose=verbose)
-                self._refresh_impedances()
+                with _EV_WINDKESSEL:
+                    for wksl in self.windkessels:
+                        wksl.update(self.u_h, verbose=verbose)
+                    self._refresh_impedances()
 
             b = self._assemble_newton_system()
             res_norm = b.norm()
@@ -1146,8 +1399,19 @@ class NewtonNSProblem(PicardNSProblem):
 
             operator = self._newton_operator if self._newton_operator is not None else self.A
             self.ksp.setOperators(operator, self.A)
+
+            # Newton solves for a correction, so zero is the right starting point: the
+            # previous correction is larger than this one and points the wrong way. The
+            # iterative path enables a nonzero guess for the Picard iteration, which does
+            # solve for the solution itself, so it has to be switched off again here.
+            self.ksp.setInitialGuessNonzero(False)
+            self._prepare_preconditioner(first_of_step=(it == 0))
             self.ksp.solve(b, self.dx_vec)
 
+            its = self.ksp.getIterationNumber()
+            lin_its += its
+            lin_its_max = max(lin_its_max, its)
+            self._record_linear_iterations(its)
             reason = self.ksp.getConvergedReason()
             if reason < 0:
                 b.destroy()
@@ -1162,13 +1426,14 @@ class NewtonNSProblem(PicardNSProblem):
             self.u_h.x.scatter_forward()
             self.p_h.x.scatter_forward()
 
-            # Relative size of the correction, the same measure the Picard path reports
-            nl_error = self._relative_velocity_change(self.up)
+            with _EV_CONVERGENCE:
+                # Relative size of the correction, the same measure the Picard path reports
+                nl_error = self._relative_velocity_change(self.up)
 
-            if self.windkessels is not None:
-                wk_error = max(w.residual() for w in self.windkessels)
-                for wksl in self.windkessels:
-                    wksl.Pd_nl_prev = wksl.Pd_nl
+                if self.windkessels is not None:
+                    wk_error = max(w.residual() for w in self.windkessels)
+                    for wksl in self.windkessels:
+                        wksl.Pd_nl_prev = wksl.Pd_nl
 
             if verbose and rank == 0:
                 print(f"      Nonlinear error: {nl_error:.2e}  residual: {res_norm:.2e}", flush=True)
@@ -1189,6 +1454,9 @@ class NewtonNSProblem(PicardNSProblem):
             "residuals": residuals,
             "converged": converged,
             "method": "newton",
+            "linear_iterations": lin_its,
+            "linear_iterations_max": lin_its_max,
+            "ksp_reason": int(reason),
         }
 
     # Advance one time step

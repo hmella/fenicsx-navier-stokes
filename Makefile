@@ -7,7 +7,7 @@ IMAGE     ?= fenicsx-ns-dev
 USER_FLAG ?= -u $(shell id -u):$(shell id -g)
 RUN       := docker run --rm $(USER_FLAG) -v "$(PWD)":/work -w /work $(IMAGE)
 
-.PHONY: help image shell test test-slow test-mpi lint docs examples clean fix-permissions
+.PHONY: help image shell test test-slow test-mpi lint profile docs examples clean fix-permissions
 
 help:                    ## list the available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -30,6 +30,15 @@ test-mpi:                ## two-rank smoke (the image ships MPICH, so no extra f
 
 lint:                    ## what CI enforces
 	$(RUN) ruff check src examples tests
+
+# STEPS and NP are overridable: `make profile STEPS=30 NP=4`
+STEPS ?= 10
+NP    ?= 8
+profile:                 ## PETSc -log_view profile of the aorta case
+	docker run --rm $(USER_FLAG) -v "$(PWD)":/work -w /work \
+	  -e PETSC_OPTIONS="-log_view :output/profile.txt" $(IMAGE) \
+	  mpirun -n $(NP) python3 examples/aorta/run.py --max-steps $(STEPS) --output output/profile
+	@echo "wrote output/profile.txt -- look at the fxns_* events and the fxns_time_loop stage"
 
 docs:                    ## build the documentation site
 	$(RUN) mkdocs build --strict

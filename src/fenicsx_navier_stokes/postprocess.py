@@ -10,16 +10,42 @@ from ufl import FacetNormal, Identity, Measure, div, dot, grad, inner, nabla_gra
 from .constitutive import eps
 
 
+# Compiled forms, cached on the function they were built for
+def _cached_form(u, key, build):
+    """
+    Returns build() the first time this key is seen for 'u', and the stored result afterwards.
+
+    These helpers are called from the examples' per-step callbacks, and a single aorta step used to construct seven forms: five flow rates through mass_balance, and two for the divergence norm. form() does not recompile -- FFCx caches its generated code on disk -- but it re-hashes the UFL signature and re-imports the module every time, which is milliseconds per call on every step of a twelve-thousand-step run.
+
+    The cache lives on the Function rather than in a module-level dictionary because a compiled form holds a reference to the coefficients it was built from. Keying by id() in a global dictionary would hand back a form bound to a different, already-collected function once an id was reused. Hanging it off 'u' ties the two lifetimes together, which is the same thing Windkessel.flow_rate does with its own _flow_form.
+    """
+    cache = getattr(u, "_fxns_form_cache", None)
+    if cache is None:
+        cache = {}
+        u._fxns_form_cache = cache
+    if key not in cache:
+        cache[key] = build()
+    return cache[key]
+
+
 # Flow rate through a tagged surface
 def flow_rate(u, facet_tags, tag, quadrature_degree=4):
     """
     Returns the integral of u.n over the facets carrying 'tag'. Positive means flow leaving the domain, since n is the outward normal.
     """
     mesh = u.function_space.mesh
-    ds = Measure("ds", domain=mesh, subdomain_data=facet_tags,
-                 metadata={"quadrature_degree": quadrature_degree})
-    n = FacetNormal(mesh)
-    return mesh.comm.allreduce(assemble_scalar(form(dot(u, n) * ds(int(tag)))), op=MPI.SUM)
+
+    def build():
+        ds = Measure("ds", domain=mesh, subdomain_data=facet_tags,
+                     metadata={"quadrature_degree": quadrature_degree})
+        n = FacetNormal(mesh)
+        # facet_tags is returned alongside the form so the cache holds a reference to it,
+        # which is what makes keying on its id safe
+        return facet_tags, form(dot(u, n) * ds(int(tag)))
+
+    _, compiled = _cached_form(u, ("flow_rate", id(facet_tags), int(tag), quadrature_degree),
+                               build)
+    return mesh.comm.allreduce(assemble_scalar(compiled), op=MPI.SUM)
 
 
 # Mass balance between the inlet and the outlets
@@ -44,9 +70,14 @@ def divergence_norm(u, quadrature_degree=4):
     Returns ||div u||_L2 / ||grad u||_L2. This is the quantity to judge a solution by, since the global balance above is exact by construction.
     """
     mesh = u.function_space.mesh
-    dx = Measure("dx", domain=mesh, metadata={"quadrature_degree": quadrature_degree})
-    num = mesh.comm.allreduce(assemble_scalar(form(div(u) ** 2 * dx)), op=MPI.SUM)
-    den = mesh.comm.allreduce(assemble_scalar(form(inner(grad(u), grad(u)) * dx)), op=MPI.SUM)
+
+    def build():
+        dx = Measure("dx", domain=mesh, metadata={"quadrature_degree": quadrature_degree})
+        return form(div(u) ** 2 * dx), form(inner(grad(u), grad(u)) * dx)
+
+    f_num, f_den = _cached_form(u, ("divergence_norm", quadrature_degree), build)
+    num = mesh.comm.allreduce(assemble_scalar(f_num), op=MPI.SUM)
+    den = mesh.comm.allreduce(assemble_scalar(f_den), op=MPI.SUM)
     return float(np.sqrt(num / den)) if den > 0 else 0.0
 
 

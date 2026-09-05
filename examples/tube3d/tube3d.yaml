@@ -28,8 +28,13 @@ Problem:
 Solver:
   Kind: "iterative"
   SolverIterations: 2000
-  SolverRTol: 1.0e-8
-  SolverATol: 1.0e-10
+  # Tight on purpose. This is a 6k-cell verification case where a solve costs half a second,
+  # and the test that global mass balance is exact by construction is a near-total
+  # cancellation of Q_in against the sum of the outflows, so it amplifies whatever residual
+  # the linear solver leaves behind. At 1e-8/1e-10 the absolute tolerance binds first and the
+  # defect sits at 6.7e-6; here it is 2.4e-9.
+  SolverRTol: 1.0e-10
+  SolverATol: 1.0e-14
   SolverGMRESRestart: 200
   NonlinearTolerance: 1.0e-4
   MaxNonlinearIterations: 30

@@ -1,0 +1,34 @@
+# 11 mm aorta, twelve cardiac cycles (12001 steps at dt = 8e-4 s, ~9.6 s of
+# physical time).  Use this when the Windkessel pressures need to reach a periodic
+# state; expect a multi-hour run on a parallel machine.  Ao11mmrest.yaml is the
+# single-cycle default.
+Problem:
+  Viscosity: 0.04
+  Density: 1.06
+  BackflowBeta: 0.2
+  Windkessels:
+    Rd: [29543.2, 2861.7, 36890.4, 40126.1]
+    Rp: [1554.9, 150.6, 1941.6, 2111.9]
+    C:  [2.7215e-05, 2.8095e-04, 2.1794e-05, 2.0037e-05]
+    Pd_init: 0.0
+    NbIters: 1000
+  SurfaceQuadratureDegree: 3
+  VolumeQuadratureDegree: 4
+  VelocityProfileFile: "data/inflow/velocity_12cycles.flow"
+  VelocityProfileScale: 1.0
+
+Solver:
+  Kind: "iterative"
+  SolverIterations: 2000
+  SolverRTol: 1.0e-8
+  SolverATol: 1.0e-7
+  SolverGMRESRestart: 200
+  NonlinearTolerance: 1.0e-2
+  MaxNonlinearIterations: 35
+
+Geometry:
+  MeshFile: "data/aorta/11mmrest/mesh_volume.xdmf"
+  BoundariesFile: "data/aorta/11mmrest/mesh_surface.xdmf"
+  WallID: 4
+  InletID: 5
+  OutletIDs: [6, 9, 7, 8]

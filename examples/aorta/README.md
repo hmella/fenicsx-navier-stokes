@@ -1,0 +1,37 @@
+# Aorta
+
+Patient-specific aorta with four RCR Windkessel outlets.
+
+| | |
+|---|---|
+| Mesh | ~110k nodes, ~640k tetrahedra (not in the repository, see `data/aorta/README.md`) |
+| Units | CGS: cm/s, poise, g/cm³, barye |
+| Time step | 8×10⁻⁴ s, cardiac cycle 0.8 s |
+| Cost | hours; run under MPI |
+
+```bash
+mpirun -n 8 python run.py --config Ao11mmrest.yaml --output ../../output/aorta11 \
+    --store-after 0 --store-every 10
+
+python run.py --max-steps 5          # smoke check
+```
+
+## Configurations
+
+| file | mesh | inflow | notes |
+|---|---|---|---|
+| `Ao9mmrest.yaml` | 9 mm | 1 cycle, scale 0.7 | wall tag 4 |
+| `Ao11mmrest.yaml` | 11 mm | 1 cycle | wall tag 4; the default |
+| `Ao11mmrest-12cycles.yaml` | 11 mm | 12 cycles | for a periodic Windkessel state |
+| `Ao13mmrest.yaml` | 13 mm | 1 cycle, scale 0.8 | **wall tag 1**, tighter tolerance |
+
+The wall tag differs between meshes. That is correct per-mesh metadata, but pointing a configuration at the wrong mesh yields no boundary conditions at all rather than an error, so the solver validates the tags at construction and refuses to run.
+
+## Output
+
+- `aorta_u.xdmf` / `aorta_p.xdmf` — velocity and pressure (separate files: they live on different spaces). Use `--store-every`; a full run writes 12000 fields, tens of GB.
+- `aorta_diagnostics.csv` — one row per step: per-cap flow and split, mass defect, divergence norm, Windkessel pressures in mmHg, Picard/convergence data, wall time. Written on rank 0 and flushed every step.
+
+## Interpreting the pressures
+
+Pressures start at `Pd_init` and charge over several cardiac cycles, so the physiological warnings will fire during the first cycle — that is expected, not a failure. Judge systolic/diastolic values only from a run that has reached a periodic state.

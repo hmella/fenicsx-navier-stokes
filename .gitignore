@@ -1,0 +1,45 @@
+# Simulation output
+output/
+*.bp/
+*.pvd
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Environments
+.venv/
+venv/
+.env
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+site/
+
+# FFCx / FEniCS JIT cache
+.cache/
+*.c
+*.so
+
+# Local assistant guidance, not part of the project
+CLAUDE.md
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# The aorta meshes are large binaries (about 28 MB) and are not kept in the repository.
+# Place them under data/aorta/<case>/ locally; see data/aorta/README.md.
+data/aorta/**
+!data/aorta/README.md

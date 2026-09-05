@@ -1,0 +1,29 @@
+# Python dependencies for the development and CI image.
+#
+# dolfinx, basix, ufl, petsc4py and mpi4py are NOT here: they cannot be installed from
+# PyPI and are supplied by the base image.
+#
+# Lower bounds only. The reproducibility that matters for results comes from the pinned
+# base image tag, not from these; pinning them exactly would mean chasing patch releases
+# for no benefit.
+
+# Runtime
+numpy>=1.24
+pyyaml>=6.0
+pint>=0.22
+
+# Geometry generation for the turek and tube3d examples
+gmsh>=4.11
+
+# Test suite
+pytest>=7.4
+pytest-timeout>=2.1
+scipy>=1.11          # Bessel functions and reference ODE integration in the tests
+
+# Linting and plots
+ruff>=0.4
+matplotlib>=3.7
+
+# Documentation site
+mkdocs-material>=9.5
+mkdocstrings[python]>=0.24

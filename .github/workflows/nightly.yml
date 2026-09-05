@@ -1,0 +1,40 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  slow:
+    name: convergence studies and benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    container:
+      image: dolfinx/dolfinx:v0.10.0
+      options: --user root
+    env:
+      PYTHONDONTWRITEBYTECODE: 1
+
+    steps:
+      # The aorta meshes are not in the repository, so the mesh-consistency test for them
+      # skips here. Everything else in the slow tier generates its own geometry.
+      - uses: actions/checkout@v4
+
+      - name: Install
+        run: |
+          apt-get update -qq && apt-get install -y -qq --no-install-recommends libgl1
+          python3 -m pip install --no-cache-dir pyyaml pint gmsh scipy matplotlib \
+            pytest pytest-timeout
+          python3 -m pip install --no-cache-dir --no-deps -e .
+
+      - name: Slow suite
+        run: python3 -m pytest tests -q --timeout=21600 -m "slow"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-results
+          path: output/
+          if-no-files-found: ignore

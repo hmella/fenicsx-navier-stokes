@@ -1,0 +1,41 @@
+# Straight 3D tube with a three-element (RCR) Windkessel outlet.
+#
+# The Windkessel parameters are chosen so that Rd*C = 1/(4*pi).  With the sin^2(2*pi*t)
+# inflow waveform in data/inflow/tube.flow this makes sin^2(tau/2) == sin^2(2*pi*t) with
+# tau = t/(Rd*C), so the outlet pressure has the closed form
+#
+#   P(t) = Rd*Q0*[ (Rp/Rd + 1/2) sin^2(tau/2) + (1/4)(1 - exp(-tau) - sin(tau)) ]
+#
+# which tests/benchmarks/test_tube.py asserts against.  Do not change Rd, C or the
+# waveform independently of each other.
+Problem:
+  Viscosity: 0.04            # poise (CGS)
+  Density: 1.06              # g/cm^3
+  BackflowBeta: 0.2
+  Windkessels:
+    Rd: [1.0]
+    Rp: [0.1]
+    C:  [0.0795774715459477]   # 1/(4*pi)
+    Pd_init: 0.0
+    NbIters: 100
+  SurfaceQuadratureDegree: 4
+  VolumeQuadratureDegree: 4
+  VelocityProfileFile: "data/inflow/tube.flow"
+  # Negative: the inlet profile points along the outward normal of the inlet cap, so a
+  # negative scale drives flow into the domain.
+  VelocityProfileScale: -1.0
+
+Solver:
+  Kind: "iterative"
+  SolverIterations: 2000
+  SolverRTol: 1.0e-8
+  SolverATol: 1.0e-10
+  SolverGMRESRestart: 200
+  NonlinearTolerance: 1.0e-4
+  MaxNonlinearIterations: 30
+
+Geometry:
+  # Must match examples/tube3d/mesh.py
+  WallID: 1
+  InletID: 2
+  OutletIDs: [3]

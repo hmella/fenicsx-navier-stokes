@@ -1,0 +1,9 @@
+# The aorta meshes are large binaries and are NOT distributed with this repository; see
+# data/aorta/README.md. Nothing here needs a filter as a result.
+
+data/inflow/*.flow text
+
+*.py text diff=python
+*.md text
+*.yaml text
+*.yml text

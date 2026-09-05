@@ -1,0 +1,29 @@
+# DFG 2D flow-around-a-cylinder benchmark (Schaefer & Turek, 1996).
+#
+# Non-dimensional: rho = 1, mu = nu = 1e-3.  With characteristic length D = 0.1 and mean
+# inflow Ubar = 1.0 (case 2d3 / 2d2) this is Re = 100; case 2d1 uses Ubar = 0.2, Re = 20.
+Problem:
+  Density: 1.0
+  Viscosity: 1.0e-3
+  BackflowBeta: 0.0          # the outlet is do-nothing; no reversal at these Reynolds numbers
+  SurfaceQuadratureDegree: 4
+  VolumeQuadratureDegree: 4
+  VelocityProfileFile: null  # the inflow is analytic; see run.py
+  VelocityProfileScale: 1.0
+
+Solver:
+  Kind: "direct"             # the benchmark meshes are small enough for MUMPS
+  SolverIterations: 2000
+  SolverRTol: 1.0e-10
+  SolverATol: 1.0e-12
+  SolverGMRESRestart: 200
+  NonlinearTolerance: 1.0e-8
+  MaxNonlinearIterations: 30
+
+Geometry:
+  # Walls and obstacle are separate tags so drag can be integrated over the cylinder
+  # alone, but both carry no-slip.
+  WallID: [4, 5]
+  InletID: 2
+  OutletIDs: [3]
+  ObstacleID: 5

@@ -1,0 +1,65 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fenicsx-navier-stokes"
+version = "0.1.0"
+description = "Stabilized incompressible Navier-Stokes solvers in FEniCSx for vascular haemodynamics"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Hernan Mella", email = "hmellalobos@gmail.com" }]
+keywords = ["fenicsx", "dolfinx", "navier-stokes", "haemodynamics", "windkessel", "SUPG", "PSPG"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Physics",
+]
+
+# NOTE: dolfinx, petsc4py, mpi4py and basix are NOT installable from PyPI.
+# They come from the container image (see docker/Dockerfile) or a conda/spack build.
+# Pinned range: dolfinx >=0.10,<0.11 -- the code uses the `kind="nest"` assembly API
+# and `V.element.interpolation_points` as a property, neither of which exists in 0.8.
+dependencies = ["numpy>=1.24", "pyyaml>=6.0", "pint>=0.22"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4", "pytest-timeout>=2.1", "ruff>=0.4"]
+mesh = ["gmsh>=4.11"]
+docs = ["mkdocs-material>=9.5", "mkdocstrings[python]>=0.24"]
+plot = ["matplotlib>=3.7", "scipy>=1.11"]
+
+[project.urls]
+Homepage = "https://github.com/hmella/fenicsx-navier-stokes"
+Repository = "https://github.com/hmella/fenicsx-navier-stokes"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fenicsx_navier_stokes"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers -m 'not slow and not benchmark'"
+markers = [
+  "slow: takes more than ~30 s; excluded from the PR job, run nightly",
+  "mpi: spawns mpirun in a subprocess",
+  "benchmark: full-resolution validation against published reference values; manual/nightly",
+  "regression: compares against a stored golden value in tests/data/golden",
+]
+# The Windkessel residual used to divide 0/0 and silently produce nan; promoting
+# RuntimeWarning to an error is what keeps that class of bug from coming back.
+filterwarnings = ["error::RuntimeWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "NPY"]
+# E501 is off deliberately: prose in comments and docstrings is written as continuous
+# lines rather than hard-wrapped to a column.
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+split-on-trailing-comma = false

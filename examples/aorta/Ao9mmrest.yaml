@@ -1,0 +1,33 @@
+Problem:
+  Viscosity: 0.04
+  Density: 1.06
+  BackflowBeta: 0.2
+  Windkessels:
+    Rd: [20563.9, 2675.3, 31919.3, 53611.6]
+    Rp: [1082.3, 140.8, 1680.0, 2821.7]
+    C: [3.6029e-05, 2.7694e-04, 2.3211e-05, 1.3820e-05]
+    # Rd: [29543.2, 2861.7, 36890.4, 40126.1]
+    # Rp: [1554.9, 150.6, 1941.6, 2111.9]
+    # C:  [2.7215e-05, 2.8095e-04, 2.1794e-05, 2.0037e-05]
+    Pd_init: 0.0
+    NbIters: 1000
+  SurfaceQuadratureDegree: 3
+  VolumeQuadratureDegree: 4
+  VelocityProfileFile: "data/inflow/velocity_1cycles.flow"
+  VelocityProfileScale: 0.7
+
+Solver:
+  Kind: "iterative"
+  SolverIterations: 2000
+  SolverRTol: 1.0e-8
+  SolverATol: 1.0e-7
+  SolverGMRESRestart: 200
+  NonlinearTolerance: 1.0e-2
+  MaxNonlinearIterations: 35
+
+Geometry:
+  MeshFile: "data/aorta/9mmrest/mesh_volume.xdmf"
+  BoundariesFile: "data/aorta/9mmrest/mesh_surface.xdmf"
+  WallID: 4
+  InletID: 5
+  OutletIDs: [6, 9, 7, 8]

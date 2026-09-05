@@ -1,0 +1,20 @@
+# Keep the build context small. The image is an environment only: the project source is
+# mounted at run time, not copied in, so almost nothing needs to be sent to the daemon.
+.git
+.github
+data
+output
+site
+docs
+examples
+src
+tests
+*.md
+!README.md
+__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.venv
+venv

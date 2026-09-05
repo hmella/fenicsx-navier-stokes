@@ -1,0 +1,46 @@
+site_name: fenicsx-navier-stokes
+site_description: Stabilized incompressible Navier-Stokes in FEniCSx for vascular haemodynamics
+repo_url: https://github.com/hmella/fenicsx-navier-stokes
+edit_uri: ""
+
+theme:
+  name: material
+  features: [navigation.sections, navigation.top, content.code.copy]
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle: {icon: material/weather-night, name: Switch to dark mode}
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle: {icon: material/weather-sunny, name: Switch to light mode}
+
+nav:
+  - Home: index.md
+  - Theory: theory.md
+  - Examples: examples.md
+  - Verification: verification.md
+  - Development notes: development.md
+  - API reference: api.md
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            docstring_style: numpy
+            show_source: true
+            show_root_heading: true
+            members_order: source
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.arithmatex: {generic: true}
+  - toc: {permalink: true}
+  - tables
+
+extra_javascript:
+  - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js

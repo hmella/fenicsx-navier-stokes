@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest (dolfinx v0.10.0)
+    runs-on: ubuntu-latest
+    container:
+      image: dolfinx/dolfinx:v0.10.0
+      options: --user root
+    env:
+      # The image ships MPICH, which runs as root without extra flags.  (The OpenMPI
+      # incantations -- OMPI_ALLOW_RUN_AS_ROOT and friends -- would be no-ops here.)
+      PYTHONDONTWRITEBYTECODE: 1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache the FFCx JIT output
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/fenics
+          key: ffcx-${{ runner.os }}-${{ hashFiles('src/**/*.py', 'tests/**/*.py') }}
+          restore-keys: ffcx-${{ runner.os }}-
+
+      - name: Install
+        run: |
+          apt-get update -qq && apt-get install -y -qq --no-install-recommends libgl1
+          python3 -m pip install --no-cache-dir pyyaml pint gmsh scipy pytest pytest-timeout ruff
+          python3 -m pip install --no-cache-dir --no-deps -e .
+
+      - name: Lint
+        run: ruff check src examples tests
+
+      - name: Serial tests
+        run: python3 -m pytest tests -q --timeout=900 -m "not slow and not benchmark and not mpi"
+
+      - name: MPI tests
+        run: python3 -m pytest tests -q --timeout=900 -m "mpi"
+
+      - name: Two-rank smoke
+        run: mpirun -n 2 python3 -m pytest tests/unit -q -x -m "not mpi and not slow and not benchmark"

@@ -395,6 +395,7 @@ class PicardNSProblem(BaseProblem):
         self._f_a00_star = form(self.a00_star)
         self._f_a01_star = form(self.a01_star)
         self._f_a10_star = form(self.a10_star)
+        self._f_a11_star = form(self.a11_star)
 
         # ---------------------------------------------------------------------------------
         # Assemble the matrices
@@ -418,12 +419,12 @@ class PicardNSProblem(BaseProblem):
         self.A10_star.assemble()
         self.A10_star.setOption(PETSc.Mat.Option.NEW_NONZERO_LOCATIONS, False)
 
-        # The (1,1) block depends only on tau_M and the pressure, so it never changes during the Picard iteration and is assembled exactly once. Passing the full bc list is deliberate: both spaces here are the pressure space, so VELOCITY conditions match neither and dolfinx discards them (which is why passing them used to be a silent no-op), but a PRESSURE condition in the list is applied, and that is what makes the block non-singular in the fully-Dirichlet case
+        # The (1,1) block is the PSPG pressure Laplacian. It carries no convective velocity, but it is still weighted by tau_M, which is built on `up` and therefore changes with every Picard iterate -- so it is re-assembled in _assemble_system alongside the other three. Passing the full bc list is deliberate: both spaces here are the pressure space, so VELOCITY conditions match neither and dolfinx discards them (which is why passing them used to be a silent no-op), but a PRESSURE condition in the list is applied, and that is what makes the block non-singular in the fully-Dirichlet case
         self.A11_star = create_matrix(form(self.a11_star))
         self.A11_star.setOption(PETSc.Mat.Option.SYMMETRIC, True)
         self.A11_star.setOption(PETSc.Mat.Option.SYMMETRY_ETERNAL, True)
         self.A11_star.setOption(PETSc.Mat.Option.IGNORE_ZERO_ENTRIES, True)
-        assemble_matrix(self.A11_star, form(self.a11_star), bcs=self.bcs, diag=1.0)
+        assemble_matrix(self.A11_star, self._f_a11_star, bcs=self.bcs, diag=1.0)
         self.A11_star.assemble()
         self.A11_star.setOption(PETSc.Mat.Option.NEW_NONZERO_LOCATIONS, False)
 
@@ -540,6 +541,11 @@ class PicardNSProblem(BaseProblem):
             assemble_matrix(A_star, f_star, bcs=self.bcs, diag=0.0)
             A_star.assemble()
             A_star.axpy(1.0, A_const)
+
+        # The (1,1) block has no constant counterpart to add back, but it is iterate-dependent through tau_M and must be refreshed too. Leaving it at its cold-start value, tau_M(up = 0), makes the continuity row weight a different strong residual from the momentum row, so the two stop being consistent parts of one stabilized system
+        self.A11_star.zeroEntries()
+        assemble_matrix(self.A11_star, self._f_a11_star, bcs=self.bcs, diag=1.0)
+        self.A11_star.assemble()
 
         self.A.assemble()
         return b

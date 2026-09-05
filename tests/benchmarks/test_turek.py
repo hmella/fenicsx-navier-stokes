@@ -113,20 +113,28 @@ def test_pressure_probes_are_inside_the_mesh(repo_root):
 
 
 @pytest.mark.slow
-def test_refinement_moves_toward_the_reference(repo_root):
-    """Halving the cell size at the cylinder must reduce the error in ``c_D``.
+def test_drag_converges_under_refinement(repo_root):
+    """Successive mesh refinements must change the answer by less and less.
 
-    The strongest statement available without a multi-hour run: not that the value is right, but that the discretization is converging toward the published one.
+    This is a Cauchy-convergence statement about the discretization, and it deliberately does not
+    mention the published reference. An earlier version of this test compared two meshes against
+    `c_D,max = 2.9509` and asserted the finer one was closer, which was not a meaningful claim at
+    this cost: 60 steps at dt = 0.02 only reaches t = 1.2 s, where the 2D-3 ramp sin(pi*t/8) is at
+    45 % of peak and the drag is around 1.0 against a reference of 2.95. The error was dominated
+    by the time window, not the mesh, so which of two meshes came out closer was very nearly a
+    coin toss -- it flipped on an unrelated change to the pressure-block assembly.
     """
     steps, dt = 60, 0.02
-    coarse = run_turek(repo_root, res_min=0.05 / 2, dt=dt, max_steps=steps)
-    fine = run_turek(repo_root, res_min=0.05 / 4, dt=dt, max_steps=steps)
+    values = []
+    for factor in (2, 4, 8):
+        records = run_turek(repo_root, res_min=0.05 / factor, dt=dt, max_steps=steps)
+        values.append(max(r["cD"] for r in records))
 
-    ref = REFERENCE["cD_max"]
-    e_coarse = abs(max(r["cD"] for r in coarse) - ref)
-    e_fine = abs(max(r["cD"] for r in fine) - ref)
-    assert e_fine < e_coarse, (
-        f"refinement did not help: coarse error {e_coarse:.4f}, fine {e_fine:.4f}"
+    first = abs(values[1] - values[0])
+    second = abs(values[2] - values[1])
+    assert second < first, (
+        f"drag is not settling under refinement: cD = {values}, "
+        f"successive changes {first:.4f} then {second:.4f}"
     )
 
 

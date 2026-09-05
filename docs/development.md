@@ -54,6 +54,7 @@ Always pass `-u "$(id -u):$(id -g)"`. Without it the container runs as root and 
 
 ## Defects fixed while packaging this code (do not reintroduce)
 
+- **`A11_star` staleness.** The PSPG (1,1) block depends on the iterate through `tau_M` and must be re-assembled every nonlinear iteration. Treating it as constant leaves it at its `tau_M(up = 0)` value, so the continuity row stops weighting a single consistent strong residual. The effect is masked at small time steps, where the transient term of `tau_M` dominates, and shows up on the physical cases where the convective term is comparable.
 - SUPG momentum block carried `rho²` while its RHS counterpart carried `rho` — inconsistent at any `rho != 1`. Caught by the patch test **on a perturbed mesh only**: on a structured mesh `tau_M` is constant per cell and the error telescopes away.
 - `tau_M` viscous term used `Ck*mu²/h⁴` (dimensionally wrong) → `Ck*(mu/(rho*h²))²`.
 - Windkessel residual divided by `Pd`, which is exactly 0 at cold start → `nan`, and `nan > tol` is False, silently dropping the criterion. Now `|ΔPd|/(P_ATOL + |Pd|)`.

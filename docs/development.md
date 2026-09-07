@@ -147,6 +147,47 @@ The coupling residual contracts at only 0.3-0.55 and is not monotonic, so Aitken
 
 The same effect bit the tube verification case. `mass_balance` is a near-total cancellation of `Q_in` against the outflows, so it amplifies whatever residual the linear solve leaves behind, and the old configuration passed its `< 1e-6` assertion only because a zero initial guess made every solve overshoot well past its tolerance. With a nonzero initial guess the solve stops where it is told to, `SolverATol: 1.0e-10` binds first, and the defect rises to 6.7e-6. Tightening both tolerances for that case (it is 6k cells and half a second a step) puts it at 2.4e-9, twenty times better than the original.
 
+## Coupling a 0D model to the 3D domain
+
+The outlets are coupled implicitly, following Esmaily Moghadam, Vignon-Clementel, Figliola and Marsden, *A modular numerical method for implicit 0D/3D coupling in cardiovascular finite element simulations*, J. Comput. Phys. **244** (2013) 63-79.
+
+The 0D model is a black box: the only thing asked of it is the map from the cap flow rates to the cap pressures. The coupling tangent
+
+    M_kl = dP_k / dQ_l
+
+is obtained by perturbing one flow rate at a time and re-evaluating the model, at a cost of `m+1` evaluations per nonlinear iteration, and enters the momentum Jacobian as `sum_kl M_kl a_k a_l^T` with `(a_k)_i = integral(phi_i . n)` over cap k. That block is dense on the cap dofs, so it is applied through a PETSc Python shell rather than inserted into the sparse nest, which keeps BoomerAMG away from dense rows.
+
+`M` is a full matrix, so outlets that share state couple correctly. Independent RCRs give a diagonal one; a network with a shared compliance gives non-zero off-diagonals; a network containing a directional element -- a valve, a pump, a one-way conduit -- gives a non-symmetric one, which is why `multTranspose` applies `M.T` rather than delegating to `mult`.
+
+### The contract a model must satisfy
+
+    cap_ids               ordered; fixes the row and column index of M
+    pressures(Q)          the map itself, with NO side effects
+    impose(Q)             evaluate it and write the result into the P_out constants
+    coupling_residual(u)  how far the imposed pressures are from the ones u implies
+    advance()             accept the state at the end of a converged step
+
+`pressures` is called `m+1` times per nonlinear iteration and must leave the model's state untouched: it integrates from the accepted previous time level every time. For the RCR that is free, since `Windkessel._distal_pressure` always starts from `Pd_prev`. A network holding an internal integrator has to save and restore around the call.
+
+`WindkesselNetwork` adapts a list of independent `Windkessel` outlets to this, and `BaseProblem` wraps a plain list in one, so callers keep passing `windkessels=[...]`.
+
+### What it changed
+
+Nothing, on the aorta, which is the point. Over 100 steps the numerical tangent reproduces the previous hard-coded analytic impedance to **5.8e-13** on every outlet flow, split and pressure, with the same sweep histogram and the same 5.1 s/step. The article's method buys generality, not speed: on four independent RCRs it computes numerically what the code computed analytically.
+
+It does fix one small inconsistency. The old `_outlet_impedance` differentiated `exp(-dt/(Rd*C))` while the model actually integrated is the RK4 stability polynomial `A^n` -- a ~1e-9 discrepancy that disappears when the tangent is taken from the model rather than from a formula.
+
+`Solver.TangentPerturbation` (default 1e-6) sets the relative step. It has an absolute floor because cap flow rates pass through zero during reversal and a purely relative step would collapse there.
+
+### What pins it down
+
+`tests/unit/test_newton.py::TestCouplingTangent::test_coupled_tangent_matches_finite_difference` is the gate, and it did not exist before. It perturbs the velocity, re-imposes the 0D model at the perturbed cap flows, and compares the change in the residual against the assembled blocks plus the shell correction. The dependence being tested is invisible to `ufl.derivative`, since `P_out` is a `Constant`, so without this test the shell could be checked against the formula it was built from and still be the derivative of nothing -- which is what the previous `test_correction_is_rank_one_and_positive` did.
+
+Two coverage traps found while writing it, both worth not repeating:
+
+- With a single outlet `M` is 1x1 and the finite-difference gate cannot see a transposed tangent. The dense fixture is what covers that.
+- Building the second cap vector as a multiple of the first makes the correction a quadratic form in one direction, which sees only the symmetric part of `M`. The transpose test passed against a deliberately broken `multTranspose` until the two vectors were made linearly independent.
+
 ## Not covered (and why)
 
 - **Poiseuille**: with the stress-divergence viscous term the do-nothing outlet is inconsistent with a fully developed profile, so even P2-P1 is not exact — the discrepancy is a boundary-condition artefact, not a scheme error. Would need an imposed outlet traction.

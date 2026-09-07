@@ -257,8 +257,64 @@ def test_postprocess_accepts_a_newton_problem(comm):
     assert np.isfinite(f_sur).all()
 
 
-class TestWindkesselJacobian:
-    """The exact rank-one outlet coupling."""
+class SharedCompliance:
+    """Two outlets on one compliance, plus a directional conduit, as a 0D model to couple to.
+
+    ``C dP/dt = Q_0 + Q_1 - P/Rd`` gives a shared node both caps charge, so
+
+        P_0 = Rp_0 Q_0 + P,        P_1 = Rp_1 Q_1 + P + h Q_0
+
+    the extra ``h Q_0`` being a pressure drop in the second branch carried by flow from the first: a conduit that passes cap 0's flow by cap 1's take-off, but not the reverse.
+
+    The tangent is therefore
+
+        M = diag(Rp) + Rd (1 - exp(-dt/(Rd C))) * ones + [[0, 0], [h, 0]]
+
+    which is dense and, thanks to ``h``, not symmetric. Both properties are deliberate. Independent RCRs give a diagonal M, so without something like this the off-diagonal path would ship untested; and a passive linear network is reciprocal, so its M comes out symmetric and would not exercise ``multTranspose``. A directional element -- a valve, a pump, a one-way conduit -- is what breaks that, and closed-loop circulation models are full of them.
+
+    Only what the tangent needs is implemented: the map from flow rates to pressures, and the cap ordering that fixes the index of M.
+    """
+
+    def __init__(self, Rp=(0.1, 0.5), Rd=1.0, C=0.25, dt=1.0e-2, P_prev=0.0, cross=0.8):
+        self.Rp = np.asarray(Rp, dtype=float)
+        self.Rd, self.C, self.dt, self.P_prev, self.cross = Rd, C, dt, P_prev, cross
+        self.cap_ids = [3, 4]
+
+    def pressures(self, flow_rates):
+        q = np.asarray(flow_rates, dtype=float)
+        decay = np.exp(-self.dt / (self.Rd * self.C))
+        total = q.sum()
+        shared = self.Rd * total + (self.P_prev - self.Rd * total) * decay
+        return self.Rp * q + shared + np.array([0.0, self.cross * q[0]])
+
+    def analytic_tangent(self):
+        decay = np.exp(-self.dt / (self.Rd * self.C))
+        M = np.diag(self.Rp) + self.Rd * (1.0 - decay) * np.ones((2, 2))
+        M[1, 0] += self.cross
+        return M
+
+
+def cap_vectors(prob):
+    """``integral(phi_i . n)`` per cap, with no boundary conditions applied.
+
+    The solver zeroes the constrained rim dofs of these, matching what ``assemble_matrix`` does to the sparse blocks. The finite-difference check below compares against a residual assembled with no conditions either, so it needs the unmodified vectors.
+    """
+    from dolfinx.fem import form
+    from ufl import FacetNormal, TestFunction, dot
+
+    v = TestFunction(prob.V)
+    n = FacetNormal(prob.mesh)
+    out = []
+    for cap in prob.outlet_model.cap_ids:
+        a = assemble_vector(form(dot(v, n) * prob.ds(cap)))
+        a.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+        out.append(a.getArray().copy())
+        a.destroy()
+    return out
+
+
+class TestCouplingTangent:
+    """The 0D/3D coupling tangent, obtained by perturbing the model rather than differentiating it."""
 
     @staticmethod
     def make(comm, cls, **kwargs):
@@ -279,64 +335,161 @@ class TestWindkesselJacobian:
                    inlet_scale=lambda k, t: 1.0, **kwargs)
         return prob, wksl
 
-    def test_impedance_matches_the_ode(self, comm):
-        """dP_out/dQ must match a finite difference of the Windkessel's own RK4 routine.
+    def test_matches_the_analytic_impedance(self, comm):
+        """The numerical tangent must reproduce the RCR's closed-form dP/dQ.
 
-        The closed form is exact for the linear RCR ODE with the flow rate frozen across the
-        step, which is how the solver drives it.
+        The reference is a finite difference of ``_distal_pressure``, the map the solver actually integrates. An earlier analytic impedance differentiated ``exp(-dt/(Rd C))`` instead, which is the limit of that map rather than the map itself.
         """
-        prob, wksl = self.make(comm, NewtonNSProblem)
-        analytic = prob._wk_impedance[0]
+        from fenicsx_navier_stokes.boundaries import numerical_tangent
 
-        base = wksl.Q_out
+        _, wksl = self.make(comm, NewtonNSProblem)
+        from fenicsx_navier_stokes.boundaries import WindkesselNetwork
+
+        net = WindkesselNetwork([wksl])
+        M = numerical_tangent(net, np.array([0.7]))
+
         eps = 1.0e-6
-        wksl.Q_out = base + eps
-        hi = wksl.RK4([0.0, wksl.dt_sim])
-        wksl.Q_out = base - eps
-        lo = wksl.RK4([0.0, wksl.dt_sim])
-        wksl.Q_out = base
-        assert analytic == pytest.approx((hi - lo) / (2.0 * eps), rel=1.0e-8)
+        hi = wksl.Rp * (0.7 + eps) + wksl._distal_pressure(0.7 + eps, wksl.dt_sim)
+        lo = wksl.Rp * (0.7 - eps) + wksl._distal_pressure(0.7 - eps, wksl.dt_sim)
+        assert M[0, 0] == pytest.approx((hi - lo) / (2.0 * eps), rel=1.0e-6)
+        assert M[0, 0] == pytest.approx(net.analytic_tangent()[0, 0], rel=1.0e-6)
 
-    def test_correction_is_rank_one_and_positive(self, comm):
-        """(A_op - A) x must equal Z (a.x) a, and be positive semi-definite.
+    def test_dense_for_a_network_that_shares_state(self):
+        """A model whose outlets share a compliance gives off-diagonal terms.
 
-        Physically the sign has to come out this way: more outflow raises the outlet pressure,
-        which resists further outflow. A negative coefficient would make the velocity block
-        indefinite and degrade the AMG preconditioner.
+        This is the case a per-outlet impedance cannot express, and the reason the tangent is a matrix rather than a list of scalars.
+        """
+        from fenicsx_navier_stokes.boundaries import numerical_tangent
+
+        model = SharedCompliance()
+        M = numerical_tangent(model, np.array([1.3, -0.4]))
+        expected = model.analytic_tangent()
+
+        assert np.abs(M - expected).max() < 1.0e-6 * np.abs(expected).max()
+        assert abs(M[0, 1]) > 0.1 * abs(M[0, 0]), "off-diagonal coupling vanished"
+        assert abs(M[1, 0] - M[0, 1]) > 0.1 * abs(M[0, 1]), "fixture is not asymmetric"
+
+    def test_perturbation_survives_zero_flow(self):
+        """A cap flow rate of exactly zero must still give a usable column.
+
+        Cap flows pass through zero during reversal, so the perturbation is relative with an absolute floor; a purely relative one would collapse to a zero step and divide by it.
+        """
+        from fenicsx_navier_stokes.boundaries import numerical_tangent
+
+        model = SharedCompliance()
+        M = numerical_tangent(model, np.array([0.0, 0.0]))
+        assert np.all(np.isfinite(M))
+        assert np.abs(M - model.analytic_tangent()).max() < 1.0e-6
+
+    def test_shell_applies_the_full_tangent(self, comm):
+        """``(A_op - A) x`` must equal ``sum_kl M_kl a_k (a_l . x)``, for a dense, non-symmetric M.
+
+        The operator is exercised directly with a fabricated tangent rather than the one the RCR produces, because a diagonal M would leave the off-diagonal path and the transpose untested.
+        """
+        from fenicsx_navier_stokes.problems import _WindkesselJacobian
+
+        prob, _ = self.make(comm, NewtonNSProblem)
+        velocity_is = prob.A.getNestISs()[0][0]
+        a = prob._wk_vectors[0]
+
+        # A second, linearly independent vector. It must not be a multiple of the first:
+        # the correction then reduces to a quadratic form in one direction, which sees only
+        # the symmetric part of M and so cannot tell mult from multTranspose.
+        rng_vec = np.random.default_rng(11)
+        a2 = a.duplicate()
+        a2.getArray()[:] = rng_vec.standard_normal(a2.getLocalSize())
+        a2.assemble()
+        M = np.array([[1.3, -0.4], [0.9, 2.1]])          # dense and non-symmetric
+        ctx = _WindkesselJacobian(prob.A, [a, a2], M, velocity_is)
+        op = PETSc.Mat().createPython(prob.A.getSizes(), ctx, comm=prob.mesh.comm)
+        op.setUp()
+
+        rng = np.random.default_rng(0)
+        for transpose, tangent in ((False, M), (True, M.T)):
+            x = prob.A.createVecRight()
+            x.set(0.0)
+            xu = x.getSubVector(velocity_is)
+            xu.getArray()[:] = rng.standard_normal(xu.getLocalSize())
+            x.restoreSubVector(velocity_is, xu)
+            x.assemble()
+
+            y = prob.A.createVecLeft()
+            if transpose:
+                op.multTranspose(x, y)
+            else:
+                op.mult(x, y)
+            y_base = prob.A.createVecLeft()
+            prob.A.mult(x, y_base)
+            y.axpy(-1.0, y_base)
+
+            expected = prob.A.createVecLeft()
+            expected.set(0.0)
+            xu = x.getSubVector(velocity_is)
+            eu = expected.getSubVector(velocity_is)
+            dots = np.array([a.dot(xu), a2.dot(xu)])
+            for vec, coeff in zip([a, a2], tangent @ dots, strict=True):
+                eu.axpy(float(coeff), vec)
+            x.restoreSubVector(velocity_is, xu)
+            expected.restoreSubVector(velocity_is, eu)
+
+            y.axpy(-1.0, expected)
+            assert y.norm() < 1e-12 * max(y_base.norm(), 1.0), (
+                f"{'multTranspose' if transpose else 'mult'} does not apply the tangent"
+            )
+        op.destroy()
+
+    def test_coupled_tangent_matches_finite_difference(self, comm):
+        """The gate: the coupled tangent is the derivative of the coupled residual.
+
+        Perturbing the velocity changes the cap flow rates, which changes the pressures the 0D model returns, which changes the traction in the residual. That dependence is invisible to ``ufl.derivative`` -- ``P_out`` is a ``Constant`` -- and is supplied entirely by the shell. So the finite difference has to re-impose the model at the perturbed velocity, and the analytic side has to be the assembled blocks *plus* the shell correction.
+
+        Without this, nothing pins the coupling tangent to the physics: the shell can be checked against the formula it was built from and still be the derivative of nothing.
         """
         prob, _ = self.make(comm, NewtonNSProblem)
-        assert prob._newton_operator is not None
+        seed_state(prob)
 
-        # A MatNest hands out either a VecNest or a flat vector depending on how it was
-        # built, so reach the velocity block through the same helper the operator uses.
-        velocity_is = prob.A.getNestISs()[0][0]
-        block = lambda v: v.getSubVector(velocity_is)  # noqa: E731
+        model = prob.outlet_model
+        a_vecs = cap_vectors(prob)
 
-        x = prob.A.createVecRight()
-        x.set(0.0)
-        xu = block(x)
-        rng = np.random.default_rng(0)
-        xu.getArray()[: prob._wk_vectors[0].getLocalSize()] = rng.standard_normal(
-            prob._wk_vectors[0].getLocalSize()
-        )
-        x.assemble()
+        n_u = prob.u_h.x.array[: prob.V.dofmap.index_map.size_local
+                               * prob.V.dofmap.index_map_bs].size
+        n_p = prob.p_h.x.array[: prob.Q.dofmap.index_map.size_local].size
 
-        y_full = prob.A.createVecLeft()
-        prob._newton_operator.mult(x, y_full)
-        y_base = prob.A.createVecLeft()
-        prob.A.mult(x, y_base)
-        y_full.axpy(-1.0, y_base)
+        rng = np.random.default_rng(3)
+        du = rng.standard_normal(n_u)
+        dp = rng.standard_normal(n_p)
 
-        a = prob._wk_vectors[0]
-        Z = prob._wk_impedance[0]
-        expected = prob.A.createVecLeft()
-        expected.set(0.0)
-        block(expected).axpy(Z * a.dot(block(x)), a)
-        expected.assemble()
+        def coupled_residual():
+            model.impose(model.flow_rates(prob.u_h))
+            return raw_residual(prob)
 
-        y_full.axpy(-1.0, expected)
-        assert y_full.norm() < 1e-12 * max(y_base.norm(), 1.0)
-        assert Z > 0.0
+        u0 = prob.u_h.x.array.copy()
+        p0 = prob.p_h.x.array.copy()
+        base = coupled_residual()
+
+        # Analytic action: assembled blocks plus the coupling correction, with the tangent
+        # taken at the same state the residual was evaluated at
+        prob._refresh_tangent(model.flow_rates(prob.u_h))
+        M = prob._wk_tangent.copy()
+        action = raw_jacobian_action(prob, du, dp)
+        dots = np.array([prob.mesh.comm.allreduce(float(a @ du), op=MPI.SUM) for a in a_vecs])
+        for a, coeff in zip(a_vecs, M @ dots, strict=True):
+            action[:n_u] += coeff * a
+
+        best = np.inf
+        for eps in (1.0e-4, 1.0e-5, 1.0e-6, 1.0e-7):
+            prob.u_h.x.array[:n_u] = u0[:n_u] + eps * du
+            prob.p_h.x.array[:n_p] = p0[:n_p] + eps * dp
+            prob.u_h.x.scatter_forward()
+            prob.p_h.x.scatter_forward()
+            fd = (coupled_residual() - base) / eps
+            num = prob.mesh.comm.allreduce(float(np.sum((fd - action) ** 2)), op=MPI.SUM)
+            den = prob.mesh.comm.allreduce(float(np.sum(action**2)), op=MPI.SUM)
+            best = min(best, np.sqrt(num) / max(np.sqrt(den), 1e-300))
+
+        prob.u_h.x.array[:] = u0
+        prob.p_h.x.array[:] = p0
+        assert best < 1.0e-5, f"coupled tangent disagrees with finite differences: {best:.3e}"
 
     def test_matches_picard_with_outlets(self, comm):
         """The exact Jacobian must not change the answer, only how fast it is reached."""

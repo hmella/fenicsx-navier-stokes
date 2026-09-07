@@ -8,10 +8,12 @@ Requires dolfinx >= 0.10, < 0.11.
 
 from .boundaries import (
     Windkessel,
+    WindkesselNetwork,
     backflow_stab,
     facet_vector_approximation,
     inlet_lap_paraboloid,
     inlet_paraboloid,
+    numerical_tangent,
     pressure_pin_bc,
     tangential_projection,
 )
@@ -44,6 +46,7 @@ __all__ = [
     "PowerLaw",
     "Projector",
     "Windkessel",
+    "WindkesselNetwork",
     "__version__",
     "backflow_stab",
     "cross_section_average",
@@ -60,6 +63,7 @@ __all__ = [
     "inlet_paraboloid",
     "magnitude",
     "mass_balance",
+    "numerical_tangent",
     "powerLaw",
     "pressure_pin_bc",
     "project",

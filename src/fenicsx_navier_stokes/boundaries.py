@@ -497,8 +497,126 @@ class Windkessel:
             )
         return p_out
 
+    def impedance(self):
+        """
+        dP_out/dQ for this outlet over one time step, in closed form.
+
+        The distal pressure is affine in Q with slope Rd*(1 - A^n), A being the RK4 stability polynomial, so
+
+            dP_out/dQ = Rp + Rd*(1 - A^n)
+
+        This is the tangent the coupled Newton iteration needs for a single independent RCR. It is not what the solver uses -- that comes from numerical_tangent(), which asks the model rather than assuming its form -- and it is kept as the reference the numerical tangent is checked against.
+        """
+        span = self.dt_sim
+        n = int(self.Niter)
+        z = (span / n) / (self.Rd * self.C)
+        Am1 = z * (-1.0 + z * (0.5 + z * (-1.0 / 6.0 + z / 24.0)))
+        A = 1.0 + Am1
+        powm1 = np.expm1(n * np.log1p(Am1)) if A > 0.0 else A**n - 1.0
+        return self.Rp - self.Rd * powm1
+
     def __repr__(self):
         return f"Windkessel(cap_id={self.cap_id}, Rp={self.Rp!r}, Rd={self.Rd!r}, C={self.C!r}, Niter={self.Niter})"
+
+
+# One lumped-parameter network coupled to the 3D domain
+class WindkesselNetwork:
+    """
+    Adapts a list of independent Windkessel outlets to the coupling interface.
+
+    The interface a 0D model presents to the solver is a map from the cap flow rates to the cap pressures:
+
+        cap_ids               ordered; fixes the row and column index of the tangent
+        pressures(Q)          the map itself, with no side effects
+        impose(Q)             evaluate it and write the result into the P_out constants
+        coupling_residual(u)  how far the imposed pressures are from the ones u implies
+        advance()             accept the state at the end of a converged step
+
+    `pressures` is called m+1 times per nonlinear iteration to build the tangent numerically, so it MUST leave the model's state untouched: it integrates from the accepted previous time level every time, never from the current iterate. Here that is free, since Windkessel._distal_pressure always starts from Pd_prev. A network holding an internal integrator would have to save and restore around the call.
+
+    Nothing about this class is specific to an RCR, and nothing about it assumes the outlets are independent. It happens to be diagonal because these outlets are; a network whose outlets share a compliance would return a full matrix from the same interface and the solver would not know the difference.
+    """
+
+    def __init__(self, outlets):
+        self.outlets = list(outlets)
+        self.cap_ids = [o.cap_id for o in self.outlets]
+
+    def __len__(self):
+        return len(self.outlets)
+
+    def __iter__(self):
+        return iter(self.outlets)
+
+    def flow_rates(self, u):
+        """Cap flow rates from the velocity field, positive leaving the domain."""
+        return np.array([o.flow_rate(u) for o in self.outlets], dtype=float)
+
+    def pressures(self, flow_rates):
+        """
+        Cap pressures for the given flow rates. No side effects.
+        """
+        return np.array(
+            [o.Rp * q + o._distal_pressure(q, o.dt_sim)
+             for o, q in zip(self.outlets, flow_rates, strict=True)],
+            dtype=float,
+        )
+
+    def impose(self, flow_rates, verbose=False, comm=None):
+        """
+        Evaluate the model and write the pressures into the constants the momentum form references. Also records what was imposed, which coupling_residual() measures against.
+        """
+        pressures = self.pressures(flow_rates)
+        for o, q, p_out in zip(self.outlets, flow_rates, pressures, strict=True):
+            o.Q_out = float(q)
+            o.Pd_nl = float(p_out) - o.Rp * float(q)
+            o.P_out.value = p_out
+            o.P_out_imposed = float(p_out)
+        if verbose and (comm is None or comm.rank == 0):
+            for o, p_out in zip(self.outlets, pressures, strict=True):
+                print(f"    [Windkessel] Pressure on cap {o.cap_id:d}: {p_out:.2e}", flush=True)
+        return pressures
+
+    def coupling_residual(self, u):
+        """
+        Largest mismatch between the imposed pressures and the ones 'u' implies.
+        """
+        return max(o.coupling_residual(u) for o in self.outlets)
+
+    def advance(self):
+        for o in self.outlets:
+            o.advance()
+
+    def analytic_tangent(self):
+        """
+        The closed-form tangent, diagonal because these outlets are independent. Used to check numerical_tangent(); not used by the solver.
+        """
+        return np.diag([o.impedance() for o in self.outlets])
+
+
+# Numerical Dirichlet-to-Neumann tangent of a 0D model
+def numerical_tangent(model, flow_rates, epsilon=1.0e-6, scale=None):
+    """
+    M[k, l] = dP_k / dQ_l, by perturbing one cap flow rate at a time and re-evaluating the model.
+
+    This is the coupling tangent of Esmaily Moghadam et al., J. Comput. Phys. 244 (2013) 63-79. The 0D model is treated as a black box: the only thing asked of it is the map from flow rates to pressures, so an arbitrary lumped-parameter network -- nonlinear, valved, closed-loop -- couples implicitly without anyone deriving its derivative by hand. Networks whose outlets share state give a dense M, which is the case a per-outlet impedance cannot express.
+
+    Costs m+1 evaluations of the model. For a network expensive enough that this matters, the tangent can be held over several iterations; the coupling is a preconditioning of the nonlinear iteration, so a stale M costs iterations rather than accuracy.
+
+    The perturbation is relative with an absolute floor: cap flow rates pass through zero during flow reversal, and a purely relative step would vanish there.
+    """
+    flow_rates = np.asarray(flow_rates, dtype=float)
+    m = flow_rates.size
+    if scale is None:
+        scale = max(float(np.max(np.abs(flow_rates))), 1.0) if m else 1.0
+
+    base = np.asarray(model.pressures(flow_rates), dtype=float)
+    tangent = np.zeros((m, m), dtype=float)
+    for col in range(m):
+        delta = epsilon * max(abs(flow_rates[col]), scale)
+        perturbed = flow_rates.copy()
+        perturbed[col] += delta
+        tangent[:, col] = (np.asarray(model.pressures(perturbed), dtype=float) - base) / delta
+    return tangent
 
 
 # Pin a single pressure degree of freedom

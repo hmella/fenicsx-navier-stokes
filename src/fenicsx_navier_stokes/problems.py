@@ -52,7 +52,7 @@ from ufl import (
     nabla_grad,
 )
 
-from .boundaries import backflow_stab, inlet_lap_paraboloid
+from .boundaries import WindkesselNetwork, backflow_stab, inlet_lap_paraboloid, numerical_tangent
 from .constitutive import eps
 from .helpers import inflow_profile
 from .stabilization import tau_C, tau_M
@@ -167,7 +167,13 @@ class BaseProblem:
         self.HDF5 = HDF5
         self.domains = domains
         self.boundaries = boundaries
-        self.windkessels = windkessels
+        # The solver talks to one 0D network, not to a list of outlets. A plain list of
+        # Windkessel objects is wrapped so that callers can keep passing one.
+        if windkessels is None or isinstance(windkessels, WindkesselNetwork):
+            self.outlet_model = windkessels
+        else:
+            self.outlet_model = WindkesselNetwork(windkessels)
+        self.windkessels = list(self.outlet_model) if self.outlet_model is not None else None
         self.element = element
         self.ds_quad_deg = ds_quad_deg
         self.dx_quad_deg = dx_quad_deg
@@ -498,6 +504,9 @@ class BaseProblem:
         self._pc_last_its = 0
         self._pc_rebuilt_this_solve = False
 
+        # Relative step used to perturb the 0D model when building the coupling tangent
+        self._tangent_epsilon = float(getattr(pars.Solver, "TangentPerturbation", 1.0e-6))
+
         # Two-level linear tolerance, see _linear_rtol
         self._rtol_final = pars.Solver.SolverRTol
         nl_tol = pars.Solver.NonlinearTolerance
@@ -642,9 +651,8 @@ class BaseProblem:
     # Roll the solution into the previous time levels
     def _advance_time_levels(self):
         self._pc_steps_since_rebuild += 1
-        if self.windkessels is not None:
-            for wksl in self.windkessels:
-                wksl.advance()
+        if self.outlet_model is not None:
+            self.outlet_model.advance()
         self.u00.x.array[:] = self.u0.x.array
         self.u0.x.array[:] = self.u_h.x.array
 
@@ -901,7 +909,7 @@ class PicardNSProblem(BaseProblem):
         rank = self.mesh.comm.rank
 
         nl_error = np.inf
-        wk_error = np.inf if self.windkessels else 0.0
+        wk_error = np.inf if self.outlet_model is not None else 0.0
         it = 0
         converged = False
         lin_its, lin_its_max, reason = 0, 0, 0
@@ -911,11 +919,11 @@ class PicardNSProblem(BaseProblem):
             if verbose and rank == 0:
                 print(f"  [Picard] Nonlinear iteration {it:d}", flush=True)
 
-            # Update the windkessels from the current iterate
-            if self.windkessels is not None:
+            # Impose the outlet pressures the 0D model gives for the current iterate
+            if self.outlet_model is not None:
                 with _EV_WINDKESSEL:
-                    for wksl in self.windkessels:
-                        wksl.update(self.up, verbose=verbose)
+                    self.outlet_model.impose(self.outlet_model.flow_rates(self.up),
+                                             verbose=verbose, comm=self.mesh.comm)
 
             # Assemble and solve
             b = self._assemble_system()
@@ -946,8 +954,8 @@ class PicardNSProblem(BaseProblem):
 
                 # Mismatch between the 0D and 3D models at the outlets, measured against the
                 # traction that was imposed; see Windkessel.coupling_residual
-                if self.windkessels is not None:
-                    wk_error = max(w.coupling_residual(self.u_h) for w in self.windkessels)
+                if self.outlet_model is not None:
+                    wk_error = self.outlet_model.coupling_residual(self.u_h)
 
             # Update the iterate
             self.up.x.array[:] = self.u_h.x.array
@@ -972,58 +980,6 @@ class PicardNSProblem(BaseProblem):
             "method": "picard",
             "linear_iterations": lin_its,
             "linear_iterations_max": lin_its_max,
-            "ksp_reason": int(reason),
-        }
-
-    # Second-order extrapolation of the velocity to the new time level
-        self.up.x.array[:] = 2.0 * self.u0.x.array - self.u00.x.array
-        self.up.x.scatter_forward()
-
-        if self.windkessels is not None:
-            with _EV_WINDKESSEL:
-                for wksl in self.windkessels:
-                    wksl.update(self.up, verbose=verbose)
-
-        b = self._assemble_system()
-        self.ksp.setOperators(self.A)
-        self.ksp.setInitialGuessNonzero(self._guess_nonzero)
-        if self._is_iterative:
-            self.ksp.setTolerances(rtol=self._rtol_final)
-        self._prepare_preconditioner(first_of_step=True)
-        self.ksp.solve(b, self.x)
-        self.u_h.x.scatter_forward()
-        self.p_h.x.scatter_forward()
-
-        its = self.ksp.getIterationNumber()
-        self._record_linear_iterations(its)
-        reason = self.ksp.getConvergedReason()
-        b.destroy()
-        if reason < 0:
-            raise RuntimeError(
-                f"linear solve diverged at step {n_time} (KSPConvergedReason={reason})"
-            )
-
-        # There is no nonlinear iteration, so the natural error measure is how far the
-        # extrapolation was from the solution it produced. It is reported, not tested against
-        # a tolerance: a large value means dt is too big for the extrapolation, which is a
-        # statement about the time step rather than about convergence.
-        nl_error = self._relative_velocity_change(self.up)
-        if self.windkessels is not None:
-            for wksl in self.windkessels:
-                wksl.Pd_nl_prev = wksl.Pd_nl
-
-        if verbose and rank == 0:
-            print(f"  [Extrapolated] Extrapolation error: {nl_error:.2e}"
-                  f"  ({its:d} linear iterations)", flush=True)
-
-        return {
-            "iterations": 1,
-            "nl_error": nl_error,
-            "wk_error": 0.0,
-            "converged": True,
-            "method": "extrapolated",
-            "linear_iterations": its,
-            "linear_iterations_max": its,
             "ksp_reason": int(reason),
         }
 
@@ -1056,41 +1012,50 @@ class PicardNSProblem(BaseProblem):
         return info
 
 
-# Applies the exact Windkessel coupling on top of the assembled blocks
+# Applies the 0D/3D coupling on top of the assembled blocks
 class _WindkesselJacobian:
     """
-    Shell operator adding the rank-one outlet terms to the sparse Jacobian.
+    Shell operator adding the outlet coupling terms to the sparse Jacobian.
 
-    The outlet pressure depends on the velocity through the flow rate, `P_out = Rp*Q + Pd(Q)` with `Q = integral(u.n) over the cap`, so the exact Jacobian carries a contribution `Z_k * a_k a_k^T` per outlet, where `(a_k)_i = integral(phi_i.n)` over the cap and `Z_k = dP_out/dQ` is the impedance the outlet presents over one time step.
+    Each cap pressure depends on every cap flow rate through the 0D model, `P_k = P_k(Q_1..Q_m)` with `Q_l = integral(u.n)` over cap l, so the Jacobian carries
 
-    That block is dense on the cap dofs. Inserting it into the sparse matrix would cost a few million extra nonzeros on the aorta and would wreck BoomerAMG, which does badly with dense rows. Applying it as a shell instead leaves the assembled nest untouched, so it can still serve as the preconditioner while the Krylov method sees the exact operator.
+        sum_kl M_kl a_k a_l^T,   (a_k)_i = integral(phi_i.n) over cap k,   M_kl = dP_k/dQ_l
+
+    `M` comes from the 0D model itself, so it is diagonal for independent outlets and full for a network whose outlets share state.
+
+    That block is dense on the cap dofs. Inserting it into the sparse matrix would cost a few million extra nonzeros on the aorta and gives BoomerAMG dense rows to work on. Applying it as a shell leaves the assembled nest untouched, so the nest still serves as the preconditioner while the Krylov method sees the exact operator.
     """
 
-    def __init__(self, base, vectors, impedances, velocity_is):
+    def __init__(self, base, vectors, tangent, velocity_is):
         self.base = base
         self.vectors = vectors
-        self.impedances = impedances
+        self.tangent = tangent
         # Index set of the velocity block within the nest. Going through it rather than
         # getNestSubVecs() is what makes this work for both layouts a MatNest may hand out:
         # sometimes a VecNest, sometimes a flat vector, depending on how the nest was built.
         self.velocity_is = velocity_is
 
-    def mult(self, mat, x, y):
+    def _apply(self, x, y, tangent):
         self.base.mult(x, y)
 
         # The correction lives entirely in the velocity block
         xu = x.getSubVector(self.velocity_is)
         yu = y.getSubVector(self.velocity_is)
         try:
-            for vec, Z in zip(self.vectors, self.impedances, strict=True):
-                yu.axpy(Z * vec.dot(xu), vec)
+            dots = np.array([vec.dot(xu) for vec in self.vectors], dtype=float)
+            for vec, coeff in zip(self.vectors, tangent @ dots, strict=True):
+                yu.axpy(float(coeff), vec)
         finally:
             x.restoreSubVector(self.velocity_is, xu)
             y.restoreSubVector(self.velocity_is, yu)
 
+    def mult(self, mat, x, y):
+        self._apply(x, y, self.tangent)
+
     def multTranspose(self, mat, x, y):
-        # The correction is symmetric, so the transpose is the same operation
-        self.mult(mat, x, y)
+        # The correction is symmetric only while M is; a network whose outlets share state
+        # gives a non-symmetric tangent
+        self._apply(x, y, self.tangent.T)
 
 
 # BDF2 / Newton stabilized Navier-Stokes problem
@@ -1217,10 +1182,10 @@ class NewtonNSProblem(PicardNSProblem):
         self._bcs_set_newton = bcs_by_block(extract_function_spaces(self._F_form), self.bcs)
         return j00, j01, j10
 
-    # Cap vectors and impedances for the exact outlet coupling
+    # Cap vectors and coupling tangent for the exact outlet coupling
     def _setup_windkessel_jacobian(self):
         self._wk_vectors = []
-        self._wk_impedance = []
+        self._wk_tangent = np.zeros((0, 0))
         self._newton_operator = None
 
         if not self.windkessels or not self.windkessel_jacobian:
@@ -1252,33 +1217,30 @@ class NewtonNSProblem(PicardNSProblem):
             cap.assemble()
 
             self._wk_vectors.append(cap)
-            self._wk_impedance.append(self._outlet_impedance(wksl))
+
+        # The tangent is rebuilt from the model at every nonlinear iteration; this is the
+        # array the shell holds a reference to, so it is filled in place afterwards
+        self._wk_tangent = np.zeros((len(self._wk_vectors), len(self._wk_vectors)))
 
         velocity_is = self.A.getNestISs()[0][0]
-        ctx = _WindkesselJacobian(self.A, self._wk_vectors, self._wk_impedance, velocity_is)
+        ctx = _WindkesselJacobian(self.A, self._wk_vectors, self._wk_tangent, velocity_is)
         self._newton_operator = PETSc.Mat().createPython(
             self.A.getSizes(), ctx, comm=self.mesh.comm
         )
         self._newton_operator.setUp()
 
-    # dP_out/dQ for one outlet over a single time step
-    @staticmethod
-    def _outlet_impedance(wksl):
+    # Rebuild the coupling tangent from the 0D model at the current cap flow rates
+    def _refresh_tangent(self, flow_rates):
         """
-        For the linear RCR ODE with the flow rate held constant across the step, the distal pressure has the closed form `Pd = Pd_prev*exp(-dt/(Rd*C)) + Rd*Q*(1 - exp(-dt/(Rd*C)))`, so
+        Fills M_kl = dP_k/dQ_l in place, so the shell operator keeps its reference.
 
-            dP_out/dQ = Rp + Rd*(1 - exp(-dt/(Rd*C)))
-
-        which agrees with a finite difference of Windkessel.RK4 to about 1e-9 relative.
+        The tangent is obtained by perturbing the model rather than by differentiating a formula, which is what makes the coupling independent of what the 0D model is. See boundaries.numerical_tangent.
         """
-        decay = np.exp(-wksl.dt_sim / (wksl.Rd * wksl.C))
-        return wksl.Rp + wksl.Rd * (1.0 - decay)
-
-    # Refresh the impedances, in case a Windkessel parameter changed after construction
-    def _refresh_impedances(self):
-        for i, wksl in enumerate(self.windkessels or []):
-            if i < len(self._wk_impedance):
-                self._wk_impedance[i] = self._outlet_impedance(wksl)
+        if self._wk_tangent.size == 0:
+            return
+        self._wk_tangent[:, :] = numerical_tangent(
+            self.outlet_model, flow_rates, epsilon=self._tangent_epsilon
+        )
 
     # Assemble the residual and the Jacobian at the current iterate
     def _assemble_newton_system(self):
@@ -1323,7 +1285,7 @@ class NewtonNSProblem(PicardNSProblem):
         rank = self.mesh.comm.rank
 
         nl_error = np.inf
-        wk_error = np.inf if self.windkessels else 0.0
+        wk_error = np.inf if self.outlet_model is not None else 0.0
         res_norm = np.inf
         residuals = []
         it = 0
@@ -1337,12 +1299,13 @@ class NewtonNSProblem(PicardNSProblem):
             # The stabilization is frozen on `up`, so track the current iterate with it
             self.up.x.array[:] = self.u_h.x.array
 
-            # Update the outlet models from the current iterate
-            if self.windkessels is not None:
+            # Impose the outlet pressures for the current iterate and rebuild the coupling
+            # tangent from the same flow rates
+            if self.outlet_model is not None:
                 with _EV_WINDKESSEL:
-                    for wksl in self.windkessels:
-                        wksl.update(self.u_h, verbose=verbose)
-                    self._refresh_impedances()
+                    flow_rates = self.outlet_model.flow_rates(self.u_h)
+                    self.outlet_model.impose(flow_rates, verbose=verbose, comm=self.mesh.comm)
+                    self._refresh_tangent(flow_rates)
 
             b = self._assemble_newton_system()
             res_norm = b.norm()
@@ -1379,8 +1342,8 @@ class NewtonNSProblem(PicardNSProblem):
                 # Relative size of the correction, the same measure the Picard path reports
                 nl_error = self._relative_velocity_change(self.up)
 
-                if self.windkessels is not None:
-                    wk_error = max(w.coupling_residual(self.u_h) for w in self.windkessels)
+                if self.outlet_model is not None:
+                    wk_error = self.outlet_model.coupling_residual(self.u_h)
 
             if verbose and rank == 0:
                 print(f"      Nonlinear error: {nl_error:.2e}  residual: {res_norm:.2e}", flush=True)

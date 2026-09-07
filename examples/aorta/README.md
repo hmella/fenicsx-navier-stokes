@@ -15,6 +15,10 @@ mpirun -n 8 python run.py --config Ao11mmrest.yaml
 
 Every parameter is in the YAML file. The `Run:` section holds the output directory, the element pair, how many steps to take and which of them are written to XDMF; set `Run.MaxSteps` to a small number for a smoke check.
 
+## Outlet coupling
+
+The four RCR outlets are coupled implicitly. The coupling tangent `dP_k/dQ_l` is obtained by perturbing the 0D model rather than by differentiating it, so any lumped-parameter network satisfying the small interface in `docs/development.md` can be attached without deriving a derivative by hand -- including networks whose outlets share state, which give a full tangent matrix. `Solver.Scheme: "newton"` is what applies it; `"picard"` lags the coupling instead.
+
 ## Configurations
 
 | file | mesh | inflow | notes |

@@ -5,13 +5,13 @@ WHAT THIS CASE IS
 -----------------
 Flow through a narrow channel with a circular obstacle in it. It is the standard verification problem for incompressible flow solvers: several groups have computed it to high accuracy, so the drag and lift on the cylinder are known numbers that a new solver can be checked against.
 
-The geometry is a channel 2.2 long and 0.41 high with a cylinder of radius 0.05 at (0.2, 0.2). Note the cylinder is slightly off the channel centreline (0.2 against 0.205). That asymmetry is deliberate: a perfectly centred cylinder would give a symmetric wake, whereas the offset triggers the alternating vortex shedding the benchmark is about.
+The geometry is a channel 2.2 long and 0.41 high with a cylinder of radius 0.05 at (0.2, 0.2), slightly off the channel centreline (0.2 against 0.205). The offset produces the alternating vortex shedding the benchmark measures.
 
 THE THREE CASES
 ---------------
 - 2d1: steady, Re = 20. Low enough that the flow settles to a steady state.
 - 2d2: Re = 100 held constant. Produces a periodic vortex street, but needs 25-30 s of physical time before the street is fully developed.
-- 2d3: Re ramps up as U(t) = 1.5*sin(pi*t/8) over t in [0, 8]. This is the default, because it starts from rest, which is exactly what the solver's BDF2 start-up assumes.
+- 2d3: Re ramps up as U(t) = 1.5*sin(pi*t/8) over t in [0, 8], starting from rest. This is the default.
 
 REFERENCE VALUES (case 2d3)
 ---------------------------
@@ -20,14 +20,18 @@ From V. John, Int. J. Numer. Meth. Fluids 44 (2004) 777-788:
 - max lift coefficient: 0.47795 at t = 5.693125
 - pressure drop at 8 s: -0.1116
 
-BE REALISTIC ABOUT COST. Matching those numbers takes millions of unknowns and hours of computing. For reference, a first-order method needed about 785000 unknowns and a time step of 0.0025 to get within 1% on drag and 9% on the pressure drop. The default mesh here is deliberately coarse, for checking that the case runs rather than for reproducing the benchmark.
+COST. Matching those numbers takes millions of unknowns and hours of computing: a first-order method needs about 785000 unknowns and a time step of 0.0025 to get within 1% on drag and 9% on the pressure drop. The shipped mesh is coarse, sized for checking that the case runs.
 
 WHAT IT WRITES
 --------------
-output/turek/turek_<case>.csv, one row per time step, with drag, lift, pressure drop and mass balance; plus XDMF fields if --store-after is given.
+<Run.Output>/turek_<case>.csv, one row per time step, with drag, lift, pressure drop and mass balance, plus XDMF fields when Run.StoreAfter is set.
+
+CONFIGURATION
+-------------
+Every parameter lives in the YAML file; the only command-line argument is which file to read. The case, mesh resolution and time step are Run.Case, Run.ResMin and Run.TimeStep.
 
 Usage:
-    python examples/turek/run.py --case 2d3 --res-min 0.00625 --dt 0.005
+    python examples/turek/run.py --config examples/turek/turek2d.yaml
 """
 
 # ruff: noqa: E402
@@ -59,9 +63,7 @@ from fenicsx_navier_stokes import (
     mass_balance,
 )
 
-# Nonlinear solver choice. Picard is the default: it is what the results in this repository were
-# produced with, and it converges from anywhere. Newton converges quadratically once close to the
-# solution, which for a transient problem the previous time step usually provides.
+# Nonlinear solvers selectable through Solver.Scheme in the configuration file
 SOLVERS = {"picard": PicardNSProblem, "newton": NewtonNSProblem}
 
 
@@ -107,32 +109,22 @@ def parabolic_inflow(V, u_max):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[1])
-    p.add_argument("--case", choices=sorted(CASES), default="2d3")
-    p.add_argument("--config", default=str(Path(__file__).parent / "turek2d.yaml"))
-    p.add_argument("--output", default="output/turek")
-    p.add_argument("--res-min", type=float, default=None,
-                   help="element size at the cylinder; default R/2 is a smoke-test mesh")
-    p.add_argument("--dt", type=float, default=0.02, help="time step")
-    p.add_argument("--t-end", type=float, default=None, help="override the case's final time")
-    p.add_argument("--max-steps", type=int, default=None, help="stop early (for a quick check)")
-    p.add_argument("--element", default="P1-P1", choices=["P1-P1", "P2-P1"])
-    p.add_argument("--store-after", type=int, default=None,
-                   help="first step to write to XDMF; omit to write no fields at all")
-    p.add_argument("--store-every", type=int, default=10, help="write every n-th step")
-    p.add_argument("--solver", default="picard", choices=sorted(SOLVERS),
-                   help="nonlinear solver: picard (default, robust) or newton (faster near the solution)")
-    p.add_argument("--quiet", action="store_true")
+    p.add_argument("--config", default=str(Path(__file__).parent / "turek2d.yaml"),
+                   help="parameter file; every setting is read from it")
     args = p.parse_args(argv)
 
-    case = CASES[args.case]
-    t_end = args.t_end if args.t_end is not None else case["t_end"]
-    num_steps = int(round(t_end / args.dt))
-
-    # Build the mesh with gmsh and read the configuration. The facet tags are inlet = 2, outlet = 3, channel walls = 4, cylinder = 5. Walls and cylinder are tagged separately so drag can be integrated over the cylinder alone, but both are no-slip, which turek2d.yaml expresses as WallID: [4, 5].
+    # Read the configuration. The facet tags are inlet = 2, outlet = 3, channel walls = 4, cylinder = 5. Walls and cylinder are tagged separately so drag can be integrated over the cylinder alone, but both are no-slip, which turek2d.yaml expresses as WallID: [4, 5].
     comm = MPI.COMM_WORLD
-    mesh, cell_tags, facet_tags = turek_mesh.generate(res_min=args.res_min, comm=comm)
     pars = ParameterHandler(args.config)
+    run = pars.Run
     obstacle = pars.Geometry.ObstacleID
+
+    case = CASES[run.Case]
+    t_end = run.TEnd if run.TEnd is not None else case["t_end"]
+    num_steps = int(round(t_end / run.TimeStep))
+
+    # Build the mesh with gmsh
+    mesh, cell_tags, facet_tags = turek_mesh.generate(res_min=run.ResMin, comm=comm)
 
     # The inlet velocity is a fixed spatial profile times a scalar that changes each step. Case 2d3 ramps that scalar as sin(pi*t/8); the other two hold it at 1.
     if case["ramp"]:
@@ -143,21 +135,22 @@ def main(argv=None):
             return 1.0
 
     # Build the parabolic profile on the velocity space. Passing it explicitly bypasses the solver's default inlet profile, which is meant for irregular anatomical caps.
-    degree = 2 if args.element == "P2-P1" else 1
+    degree = 2 if run.Element == "P2-P1" else 1
     VE = basix_element("Lagrange", mesh.topology.cell_name(), degree, shape=(2,))
     inflow = parabolic_inflow(functionspace(mesh, VE), case["u_max"])
 
-    problem = SOLVERS[args.solver](parameters=pars, mesh=mesh,
-                                   XDMF=args.store_after is not None,
-                                   domains=cell_tags, boundaries=facet_tags,
-                                   element=args.element, dt=args.dt, num_steps=num_steps,
-                                   inlet_profile=inflow, inlet_scale=scale)
+    problem = SOLVERS[pars.Solver.Scheme](parameters=pars, mesh=mesh,
+                                          XDMF=run.StoreAfter is not None,
+                                          domains=cell_tags, boundaries=facet_tags,
+                                          element=run.Element, dt=run.TimeStep,
+                                          num_steps=num_steps,
+                                          inlet_profile=inflow, inlet_scale=scale)
 
     # Mean inflow velocity, used to non-dimensionalise the forces
     u_bar = 2.0 / 3.0 * case["u_max"]
     rho = float(problem.rho.value)
 
-    out = Path(args.output)
+    out = Path(run.Output)
     if comm.rank == 0:
         out.mkdir(parents=True, exist_ok=True)
 
@@ -193,13 +186,13 @@ def main(argv=None):
                         "converged": int(info["converged"])})
 
     # Run the time loop
-    problem.solve(xdmf_path=str(out / f"turek_{args.case}.xdmf"),
-                  store_after=args.store_after, store_every=args.store_every,
-                  max_steps=args.max_steps, verbose=not args.quiet, callback=record)
+    problem.solve(xdmf_path=str(out / f"turek_{run.Case}.xdmf"),
+                  store_after=run.StoreAfter, store_every=run.StoreEvery,
+                  max_steps=run.MaxSteps, verbose=run.Verbose, callback=record)
 
     # Write the diagnostics and compare against the reference where that is meaningful
     if comm.rank == 0 and records:
-        csv_path = out / f"turek_{args.case}.csv"
+        csv_path = out / f"turek_{run.Case}.csv"
         with open(csv_path, "w", newline="") as fh:
             writer = csv.DictWriter(fh, fieldnames=list(records[0]))
             writer.writeheader()
@@ -209,14 +202,14 @@ def main(argv=None):
         cL = np.array([r["cL"] for r in records])
         ts = np.array([r["time"] for r in records])
         n_cells = mesh.topology.index_map(2).size_global
-        print(f"\n[turek {args.case}] {len(records)} steps, {n_cells} cells, dt={args.dt}")
+        print(f"\n[turek {run.Case}] {len(records)} steps, {n_cells} cells, dt={run.TimeStep}")
         print(f"  cD max  = {cD.max():.6f} at t = {ts[cD.argmax()]:.5f}")
         print(f"  cL max  = {cL.max():.6f} at t = {ts[cL.argmax()]:.5f}")
         print(f"  dp end  = {records[-1]['dp']:.6f}")
         print(f"  mass defect (max) = {max(r['mass_defect'] for r in records):.3e}")
 
         # The reference values describe the complete 8 second ramp, so only report the comparison when the run actually covered it
-        if args.case == "2d3" and ts[-1] >= 7.9:
+        if run.Case == "2d3" and ts[-1] >= 7.9:
             ref = REFERENCE_2D3
             print(f"  reference (John 2004): cD_max={ref['cD_max']:.6f}, "
                   f"cL_max={ref['cL_max']:.5f}, dp(8s)={ref['dp_end']:.4f}")

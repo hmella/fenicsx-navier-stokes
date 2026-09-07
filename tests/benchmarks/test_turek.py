@@ -13,34 +13,24 @@ Matching these is out of reach for CI, and saying so plainly is more useful than
 
 import numpy as np
 import pytest
-from conftest import load_example_module
+from conftest import example_config, load_example_module
 
 REFERENCE = {"cD_max": 2.950921575, "cL_max": 0.47795, "dp_end": -0.1116}
 
 
-def run_turek(repo_root, res_min=None, dt=0.02, max_steps=25, case="2d3"):
+def run_turek(tmp_path, res_min=None, dt=0.02, max_steps=25, case="2d3"):
     turek_run = load_example_module("turek", "run.py")
-    argv = [
-        "--case",
-        case,
-        "--config",
-        str(repo_root / "examples" / "turek" / "turek2d.yaml"),
-        "--output",
-        "output/test_turek",
-        "--dt",
-        str(dt),
-        "--max-steps",
-        str(max_steps),
-        "--quiet",
-    ]
-    if res_min is not None:
-        argv += ["--res-min", str(res_min)]
-    return turek_run.main(argv)
+    config = example_config(
+        tmp_path, "turek", "turek2d.yaml",
+        Run__Case=case, Run__Output="output/test_turek", Run__TimeStep=dt,
+        Run__MaxSteps=max_steps, Run__ResMin=res_min, Run__Verbose=False,
+    )
+    return turek_run.main(["--config", config])
 
 
 @pytest.fixture(scope="module")
-def smoke(repo_root):
-    return run_turek(repo_root, max_steps=25)
+def smoke(tmp_path_factory):
+    return run_turek(tmp_path_factory.mktemp("turek_smoke"), max_steps=25)
 
 
 def test_solver_converges(smoke):
@@ -84,7 +74,7 @@ def test_stress_forms_agree(smoke):
     assert gap < 0.30, f"drag formulations differ by {gap:.1%}"
 
 
-def test_pressure_probes_are_inside_the_mesh(repo_root):
+def test_pressure_probes_are_inside_the_mesh(tmp_path):
     """The benchmark's probes sit exactly on the cylinder, which a polygon inscribes.
 
     Whether an un-nudged probe is found depends on where mesh vertices happen to land: on the circle itself the point may coincide with a polygon vertex and be located, or fall in a chord's shadow and be missed entirely.  The nudge removes that dependence.  This test asserts both halves of the contract -- nudged probes always evaluate, and a point genuinely outside the fluid domain raises rather than returning a silent ``nan``.
@@ -113,7 +103,7 @@ def test_pressure_probes_are_inside_the_mesh(repo_root):
 
 
 @pytest.mark.slow
-def test_drag_converges_under_refinement(repo_root):
+def test_drag_converges_under_refinement(tmp_path):
     """Successive mesh refinements must change the answer by less and less.
 
     This is a Cauchy-convergence statement about the discretization, and it deliberately does not
@@ -127,7 +117,7 @@ def test_drag_converges_under_refinement(repo_root):
     steps, dt = 60, 0.02
     values = []
     for factor in (2, 4, 8):
-        records = run_turek(repo_root, res_min=0.05 / factor, dt=dt, max_steps=steps)
+        records = run_turek(tmp_path, res_min=0.05 / factor, dt=dt, max_steps=steps)
         values.append(max(r["cD"] for r in records))
 
     first = abs(values[1] - values[0])
@@ -139,9 +129,9 @@ def test_drag_converges_under_refinement(repo_root):
 
 
 @pytest.mark.benchmark
-def test_2d3_against_reference(repo_root):
+def test_2d3_against_reference(tmp_path):
     """The full DFG 2D-3 comparison.  Hours, and excluded from every automated tier."""
-    records = run_turek(repo_root, res_min=0.05 / 8, dt=0.005, max_steps=int(8.0 / 0.005))
+    records = run_turek(tmp_path, res_min=0.05 / 8, dt=0.005, max_steps=int(8.0 / 0.005))
     cD = np.array([r["cD"] for r in records])
     cL = np.array([r["cL"] for r in records])
     assert abs(cD.max() - REFERENCE["cD_max"]) / REFERENCE["cD_max"] < 0.05

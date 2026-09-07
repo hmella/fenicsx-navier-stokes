@@ -10,11 +10,10 @@ Patient-specific aorta with four RCR Windkessel outlets.
 | Cost | hours; run under MPI |
 
 ```bash
-mpirun -n 8 python run.py --config Ao11mmrest.yaml --output ../../output/aorta11 \
-    --store-after 0 --store-every 10
-
-python run.py --max-steps 5          # smoke check
+mpirun -n 8 python run.py --config Ao11mmrest.yaml
 ```
+
+Every parameter is in the YAML file. The `Run:` section holds the output directory, the element pair, how many steps to take and which of them are written to XDMF; set `Run.MaxSteps` to a small number for a smoke check.
 
 ## Configurations
 

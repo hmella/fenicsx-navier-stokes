@@ -31,22 +31,31 @@ test-mpi:                ## two-rank smoke (the image ships MPICH, so no extra f
 lint:                    ## what CI enforces
 	$(RUN) ruff check src examples tests
 
-# STEPS and NP are overridable: `make profile STEPS=30 NP=4`
-STEPS ?= 10
-NP    ?= 8
+# NP is overridable: `make profile NP=4`. Step count and output directory come from
+# examples/aorta/Ao11mmrest.yaml, like every other parameter.
+NP ?= 8
 profile:                 ## PETSc -log_view profile of the aorta case
 	docker run --rm $(USER_FLAG) -v "$(PWD)":/work -w /work \
 	  -e PETSC_OPTIONS="-log_view :output/profile.txt" $(IMAGE) \
-	  mpirun -n $(NP) python3 examples/aorta/run.py --max-steps $(STEPS) --output output/profile
+	  mpirun -n $(NP) python3 examples/aorta/run.py
 	@echo "wrote output/profile.txt -- look at the fxns_* events and the fxns_time_loop stage"
 
 docs:                    ## build the documentation site
 	$(RUN) mkdocs build --strict
 
-examples:                ## run every example at smoke size
-	$(RUN) python3 examples/turek/run.py  --case 2d3 --dt 0.02 --max-steps 20 --quiet
-	$(RUN) python3 examples/tube3d/run.py --radius 0.5 --length 5 --resolution 0.15 --max-steps 20 --quiet
-	$(RUN) python3 examples/aorta/run.py  --max-steps 3 --quiet
+# Shortened copies of the shipped configurations, so the smoke run is a smoke run.
+# Everything else about each case is whatever its own configuration file says.
+define smoke
+	@mkdir -p output
+	$(RUN) python3 examples/shorten_config.py $(1) output/smoke_$(2).yaml \
+	  --max-steps $(3) --output output/smoke_$(2)
+	$(RUN) python3 examples/$(2)/run.py --config output/smoke_$(2).yaml
+endef
+
+examples:                ## run every example for a few steps as a smoke check
+	$(call smoke,examples/turek/turek2d.yaml,turek,20)
+	$(call smoke,examples/tube3d/tube3d.yaml,tube3d,20)
+	$(call smoke,examples/aorta/Ao11mmrest.yaml,aorta,3)
 
 fix-permissions:         ## reclaim files a root container left behind
 	docker run --rm -v "$(PWD)":/work $(IMAGE) chown -R $(shell id -u):$(shell id -g) /work

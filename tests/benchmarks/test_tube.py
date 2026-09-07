@@ -16,7 +16,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from conftest import load_example_module
+from conftest import example_config, load_example_module
 
 _spec = importlib.util.spec_from_file_location(
     "rcr", Path(__file__).resolve().parents[1] / "_ref" / "rcr.py"
@@ -27,31 +27,20 @@ _spec.loader.exec_module(rcr)
 RD, RP, C = 1.0, 0.1, 1.0 / (4.0 * np.pi)
 
 
-def run_tube(repo_root, radius=0.5, length=5.0, resolution=0.15, max_steps=25):
+def run_tube(tmp_path, radius=0.5, length=5.0, resolution=0.15, max_steps=25):
     """Run the shipped tube example and return its per-step records."""
     tube_run = load_example_module("tube3d", "run.py")
-    return tube_run.main(
-        [
-            "--config",
-            str(repo_root / "examples" / "tube3d" / "tube3d.yaml"),
-            "--output",
-            "output/test_tube",
-            "--radius",
-            str(radius),
-            "--length",
-            str(length),
-            "--resolution",
-            str(resolution),
-            "--max-steps",
-            str(max_steps),
-            "--quiet",
-        ]
+    config = example_config(
+        tmp_path, "tube3d", "tube3d.yaml",
+        Run__Output="output/test_tube", Run__Radius=radius, Run__Length=length,
+        Run__Resolution=resolution, Run__MaxSteps=max_steps, Run__Verbose=False,
     )
+    return tube_run.main(["--config", config])
 
 
 @pytest.fixture(scope="module")
-def short_run(repo_root):
-    return run_tube(repo_root, max_steps=25)
+def short_run(tmp_path_factory):
+    return run_tube(tmp_path_factory.mktemp("tube_smoke"), max_steps=25)
 
 
 def test_solver_converges_every_step(short_run):
@@ -87,12 +76,12 @@ def test_flow_enters_the_domain(short_run):
 
 
 @pytest.mark.slow
-def test_rcr_ode_consistency(repo_root):
+def test_rcr_ode_consistency(tmp_path):
     """The recorded (Q, Pd) series must satisfy ``C dPd/dt + Pd/Rd == Q``.
 
     The primary Windkessel assertion.  It compares the solver against its own flow rate, so it is insensitive to the mesh and to whatever amplitude the CFD produces.
     """
-    records = run_tube(repo_root, max_steps=250)
+    records = run_tube(tmp_path, max_steps=250)
     dt = records[1]["time"] - records[0]["time"]
     pd = np.array([r["Pd_3"] for r in records])
     q = np.array([r["Q_out_3"] for r in records])
@@ -106,12 +95,12 @@ def test_rcr_ode_consistency(repo_root):
 
 
 @pytest.mark.slow
-def test_rcr_matches_the_closed_form(repo_root):
+def test_rcr_matches_the_closed_form(tmp_path):
     """The outlet pressure must follow the analytic RCR solution.
 
     ``Q0`` is taken from the simulation rather than assumed, so this measures the Windkessel coupling rather than the CFD's flow amplitude.
     """
-    records = run_tube(repo_root, max_steps=250)
+    records = run_tube(tmp_path, max_steps=250)
     t = np.array([r["time"] for r in records])
     p_sim = np.array([r["P_out_3"] for r in records])
     q0 = float(np.abs([r["Q_out_3"] for r in records]).max())

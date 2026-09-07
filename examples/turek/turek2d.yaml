@@ -20,6 +20,9 @@ Solver:
   NonlinearTolerance: 1.0e-8
   MaxNonlinearIterations: 30
 
+  # Nonlinear solver: "newton" or "picard"
+  Scheme: "picard"
+
 Geometry:
   # Walls and obstacle are separate tags so drag can be integrated over the cylinder
   # alone, but both carry no-slip.
@@ -27,3 +30,15 @@ Geometry:
   InletID: 2
   OutletIDs: [3]
   ObstacleID: 5
+
+Run:
+  Case: "2d3"          # 2d1 (steady, Re 20), 2d2 (steady, Re 100) or 2d3 (ramped, Re 100)
+  Output: "output/turek"
+  Element: "P1-P1"
+  ResMin: null         # element size at the cylinder; null uses R/2, a smoke-test mesh
+  TimeStep: 0.02
+  TEnd: null           # null uses the case's own final time
+  MaxSteps: null       # null runs to TEnd
+  StoreAfter: null     # first step written to XDMF; null writes no fields
+  StoreEvery: 10
+  Verbose: true

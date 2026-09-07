@@ -5,7 +5,7 @@ WHAT THIS CASE IS
 -----------------
 Blood flow through an aorta reconstructed from medical imaging. Flow enters at the aortic root from a measured waveform, and leaves through four branch vessels, each coupled to a lumped model of the circulation downstream of it.
 
-This is the production case the library was built for. It is large -- roughly 110000 nodes and 640000 tetrahedra, 1000 time steps per heartbeat -- so it is a multi-hour parallel run, not something to try casually. Use --max-steps first to check everything assembles.
+This is the production case the library was built for. It is large -- roughly 110000 nodes and 640000 tetrahedra, 1000 time steps per heartbeat -- so it is a multi-hour parallel run. Set Run.MaxSteps in the configuration file to a small number to check that everything assembles.
 
 UNITS
 -----
@@ -17,18 +17,20 @@ Everything is CGS, which is conventional in haemodynamics:
 - pressure: barye (divide by 1333.22 to get mmHg)
 The diagnostics below convert pressures to mmHg, because that is what a clinician reads.
 
-WHY THERE ARE NO PASS/FAIL CHECKS
----------------------------------
-There is no trusted reference solution for this geometry, so the script reports physical diagnostics and warns when they look unphysiological, rather than asserting anything. Note in particular that the Windkessel pressures start from zero and take several heartbeats to charge up to physiological values, so the warnings WILL fire during the first cycle. That is expected, not a failure.
+DIAGNOSTICS
+-----------
+The script reports physical diagnostics and warns when they fall outside physiological ranges; it asserts nothing. The Windkessel pressures start from zero and take several heartbeats to charge, so the warnings fire during the first cycle.
 
 WHAT IT WRITES
 --------------
-output/aorta/aorta_diagnostics.csv, one row per time step, flushed as it goes so that a job killed by a scheduler still leaves usable data; plus XDMF fields if --store-after is given.
+<Run.Output>/aorta_diagnostics.csv, one row per time step, flushed as it goes, plus XDMF fields when Run.StoreAfter is set.
+
+CONFIGURATION
+-------------
+Every parameter lives in the YAML file; the only command-line argument is which file to read. Set Run.MaxSteps to a small number for a quick check that the case assembles and runs.
 
 Usage:
-    mpirun -n 8 python examples/aorta/run.py --config examples/aorta/Ao11mmrest.yaml \\
-        --output output/aorta11 --store-after 0
-    python examples/aorta/run.py --max-steps 5      # quick check that it runs
+    mpirun -n 8 python examples/aorta/run.py --config examples/aorta/Ao11mmrest.yaml
 """
 
 # ruff: noqa: E402
@@ -57,9 +59,7 @@ from fenicsx_navier_stokes import (
     mass_balance,
 )
 
-# Nonlinear solver choice. Picard is the default: it is what the results in this repository were
-# produced with, and it converges from anywhere. Newton converges quadratically once close to the
-# solution, which for a transient problem the previous time step usually provides.
+# Nonlinear solvers selectable through Solver.Scheme in the configuration file
 SOLVERS = {"picard": PicardNSProblem, "newton": NewtonNSProblem}
 
 
@@ -226,25 +226,14 @@ class Diagnostics:
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[1])
     p.add_argument("--config", default=str(Path(__file__).parent / "Ao11mmrest.yaml"),
-                   help="which aorta and which inflow waveform to run")
-    p.add_argument("--output", default="output/aorta")
-    p.add_argument("--element", default="P1-P1", choices=["P1-P1", "P2-P1"])
-    p.add_argument("--plateau-lam", type=float, default=0.15,
-                   help="inlet profile shape: small gives a plug, large a parabola")
-    p.add_argument("--max-steps", type=int, default=None, help="stop early (for a quick check)")
-    p.add_argument("--store-after", type=int, default=None,
-                   help="first step to write to XDMF; omit to write no fields at all")
-    p.add_argument("--store-every", type=int, default=10,
-                   help="write every n-th step; a full run is 12000 steps, so keep this high")
-    p.add_argument("--solver", default="picard", choices=sorted(SOLVERS),
-                   help="nonlinear solver: picard (default, robust) or newton (faster near the solution)")
-    p.add_argument("--quiet", action="store_true")
+                   help="parameter file; every setting is read from it")
     args = p.parse_args(argv)
 
     comm = MPI.COMM_WORLD
 
     # Configuration, mesh and inflow waveform. The waveform's row spacing sets the time step: 8e-4 s here, with a heartbeat lasting 0.8 s, so 1000 steps per cycle.
     pars = ParameterHandler(args.config)
+    run = pars.Run
     mesh, cell_tags, facet_tags = read_mesh(pars, comm)
     inflow = np.loadtxt(pars.Problem.VelocityProfileFile)
     dt = float(inflow[1, 0] - inflow[0, 0])
@@ -252,21 +241,21 @@ def main(argv=None):
     windkessels = build_windkessels(pars, mesh, facet_tags, dt)
 
     # Assemble the problem. The inlet profile is computed from the geometry of the cap itself rather than assumed to be round, since a segmented aortic root is not.
-    problem = SOLVERS[args.solver](parameters=pars, mesh=mesh,
-                                   XDMF=args.store_after is not None,
-                                   domains=cell_tags, boundaries=facet_tags,
-                                   windkessels=windkessels, element=args.element,
-                                   inlet_plateau_lam=args.plateau_lam)
+    problem = SOLVERS[pars.Solver.Scheme](parameters=pars, mesh=mesh,
+                                          XDMF=run.StoreAfter is not None,
+                                          domains=cell_tags, boundaries=facet_tags,
+                                          windkessels=windkessels, element=run.Element,
+                                          inlet_plateau_lam=run.InletPlateauLambda)
 
     # Run, logging diagnostics as we go. The try/finally makes sure the CSV is closed even if the run is interrupted.
-    out = Path(args.output)
+    out = Path(run.Output)
     cycle_steps = int(round(0.8 / dt))  # one heartbeat
     diagnostics = Diagnostics(out / "aorta_diagnostics.csv", pars, windkessels, comm,
                               cycle_steps)
     try:
-        problem.solve(xdmf_path=str(out / "aorta.xdmf"), store_after=args.store_after,
-                      store_every=args.store_every, max_steps=args.max_steps,
-                      verbose=not args.quiet, callback=diagnostics)
+        problem.solve(xdmf_path=str(out / "aorta.xdmf"), store_after=run.StoreAfter,
+                      store_every=run.StoreEvery, max_steps=run.MaxSteps,
+                      verbose=run.Verbose, callback=diagnostics)
     finally:
         diagnostics.close()
 

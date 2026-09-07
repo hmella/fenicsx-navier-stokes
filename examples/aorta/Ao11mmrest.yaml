@@ -29,6 +29,9 @@ Solver:
   NonlinearTolerance: 1.0e-2
   MaxNonlinearIterations: 35
 
+  # Nonlinear solver: "newton" or "picard"
+  Scheme: "newton"
+
   # Every accepted solve on this case stops on SolverATol, not SolverRTol -- the ksp_reason
   # column of the diagnostics CSV records which (2 = ATOL, 3 = RTOL). Tune the absolute one.
 
@@ -47,15 +50,18 @@ Solver:
   AMGInterpType: "ext+i"
   AMGAggressiveLevels: 1
 
-  # picard iterates the convection to convergence. extrapolated does a single linear solve per
-  # step about 2u^n - u^{n-1}, which is roughly twice as fast here since 99 % of steps take
-  # exactly two Picard iterations -- but it is a different discretization whose temporal order
-  # has not been verified. See docs/development.md before switching.
-  NonlinearScheme: "picard"
-
 Geometry:
   MeshFile: "data/aorta/11mmrest/mesh_volume.xdmf"
   BoundariesFile: "data/aorta/11mmrest/mesh_surface.xdmf"
   WallID: 4
   InletID: 5
   OutletIDs: [6, 9, 7, 8]
+
+Run:
+  Output: "output/aorta11"
+  Element: "P1-P1"
+  InletPlateauLambda: 0.15
+  MaxSteps: null
+  StoreAfter: null
+  StoreEvery: 10
+  Verbose: true

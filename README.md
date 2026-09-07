@@ -82,16 +82,12 @@ The image sets `PYTHONDONTWRITEBYTECODE=1` for the same reason, and points the F
 ### Run a simulation
 
 ```bash
-# one cardiac cycle of the aorta on 8 ranks, writing every 10th step to XDMF
+# one cardiac cycle of the aorta on 8 ranks
 docker run --rm -u "$(id -u):$(id -g)" -v "$PWD":/work -w /work fenicsx-ns-dev \
-    mpirun -n 8 python3 examples/aorta/run.py \
-        --config examples/aorta/Ao11mmrest.yaml \
-        --output output/aorta11 \
-        --store-after 0 \
-        --store-every 10
+    mpirun -n 8 python3 examples/aorta/run.py --config examples/aorta/Ao11mmrest.yaml
 ```
 
-`--store-after` is what enables field output; without it only the diagnostics CSV is written. Results land in `output/` on the host, which is gitignored.
+`--config` is the only command-line argument the examples take; every parameter is set in the YAML file. The `Run:` section holds the output directory, the element pair, how many steps to take and which of them are written to XDMF. Setting `Run.StoreAfter` enables field output; leaving it `null` writes only the diagnostics CSV. Results land in `output/` on the host, which is gitignored.
 
 ### Data
 
@@ -111,17 +107,16 @@ pip install -e ".[dev,mesh,plot]"
 
 ```bash
 # DFG 2D-3 cylinder benchmark: drag, lift and pressure drop to CSV
-python examples/turek/run.py --case 2d3 --res-min 0.00625 --dt 0.005
+python examples/turek/run.py --config examples/turek/turek2d.yaml
 
 # 3D vessel segment with an RCR Windkessel outlet
-python examples/tube3d/run.py --radius 2.0 --length 30.0 --resolution 0.5
+python examples/tube3d/run.py --config examples/tube3d/tube3d.yaml
 
 # Patient-specific aorta, four Windkessel outlets (hours; use MPI)
-mpirun -n 8 python examples/aorta/run.py \
-    --config examples/aorta/Ao11mmrest.yaml --output output/aorta11 --store-after 0
+mpirun -n 8 python examples/aorta/run.py --config examples/aorta/Ao11mmrest.yaml
 ```
 
-Each writes a per-step CSV of diagnostics alongside the XDMF fields. Add `--max-steps N` to any of them for a quick check.
+Each writes a per-step CSV of diagnostics alongside the XDMF fields. Mesh resolution, time step, run length and output paths are all in the `Run:` section of the corresponding YAML file; set `Run.MaxSteps` to a small number for a quick check.
 
 These are shown as bare commands for readability; run them inside the container, either from `make shell` or by prefixing `docker run --rm -u "$(id -u):$(id -g)" -v "$PWD":/work -w /work fenicsx-ns-dev`. `make examples` runs all three at smoke size.
 

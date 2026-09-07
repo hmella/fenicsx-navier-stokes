@@ -12,7 +12,7 @@ Stabilized incompressible Navier–Stokes solvers in [FEniCSx](https://fenicspro
 ```bash
 make image                     # build the pinned dolfinx container
 make test                      # fast test suite
-python examples/turek/run.py --case 2d3 --max-steps 50
+python examples/turek/run.py       # settings come from examples/turek/turek2d.yaml
 ```
 
 ## Requirements

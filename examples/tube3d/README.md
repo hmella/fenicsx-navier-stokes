@@ -3,9 +3,11 @@
 A straight vessel segment (SimVascular-style): a cylinder of radius `R` and length `L` along the z axis, driven by a prescribed inflow waveform, with a three-element RCR Windkessel on the outlet.
 
 ```bash
-python run.py --radius 2.0 --length 30.0 --resolution 0.5
+python run.py --config tube3d.yaml
 python tube_mesh.py --radius 2.0 --length 30.0 --output ../../data/tube3d/tube  # mesh only
 ```
+
+Geometry and mesh resolution are `Run.Radius`, `Run.Length`, `Run.Resolution` and `Run.WallResolution` in `tube3d.yaml`.
 
 Facet tags are `wall=1`, `inlet=2`, `outlet=3`, matching `tube3d.yaml`.
 

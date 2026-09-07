@@ -3,9 +3,11 @@
 Channel `[0, 2.2] × [0, 0.41]` with a cylinder of radius 0.05 at `(0.2, 0.2)`. The centre is offset from the mid-height (0.2 against 0.205), which is what triggers shedding rather than a symmetric wake.
 
 ```bash
-python run.py --case 2d3 --res-min 0.00625 --dt 0.005
+python run.py --config turek2d.yaml
 python turek_mesh.py --res-min 0.00625 --output ../../data/turek/turek   # mesh only
 ```
+
+The case, mesh resolution and time step are `Run.Case`, `Run.ResMin` and `Run.TimeStep` in `turek2d.yaml`.
 
 | case | inflow | Re | notes |
 |---|---|---|---|

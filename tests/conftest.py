@@ -229,6 +229,26 @@ def perturb_interior_vertices(mesh, amplitude=0.25, seed=0):
     return mesh
 
 
+def example_config(tmp_path, example, filename, **overrides):
+    """Copy a shipped example configuration, apply ``overrides``, and return the new path.
+
+    Overrides are given as ``Section__Key=value`` and are applied to the parsed YAML before it is written back out.  The examples take no parameters on the command line, so this is how a test asks one of them for a smaller mesh or a shorter run.
+    """
+    import yaml
+
+    src = REPO_ROOT / "examples" / example / filename
+    with open(src) as fh:
+        data = yaml.safe_load(fh)
+    for key, value in overrides.items():
+        section, _, name = key.partition("__")
+        data.setdefault(section, {})[name] = value
+
+    dest = tmp_path / filename
+    with open(dest, "w") as fh:
+        yaml.safe_dump(data, fh, sort_keys=False)
+    return str(dest)
+
+
 def load_example_module(example, filename):
     """Import a module from ``examples/<example>/`` under a unique name.
 

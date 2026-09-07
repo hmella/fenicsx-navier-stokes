@@ -29,9 +29,21 @@ Solver:
   NonlinearTolerance: 1.0e-4
   MaxNonlinearIterations: 35
 
+  # Nonlinear solver: "newton" or "picard"
+  Scheme: "newton"
+
 Geometry:
   MeshFile: "data/aorta/13mmrest/mesh_volume.xdmf"
   BoundariesFile: "data/aorta/13mmrest/mesh_surface.xdmf"
   WallID: 1
   InletID: 5
   OutletIDs: [6, 9, 7, 8]
+
+Run:
+  Output: "output/aorta13"
+  Element: "P1-P1"
+  InletPlateauLambda: 0.15
+  MaxSteps: null
+  StoreAfter: null
+  StoreEvery: 10
+  Verbose: true

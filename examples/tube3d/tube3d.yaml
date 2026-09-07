@@ -39,8 +39,24 @@ Solver:
   NonlinearTolerance: 1.0e-4
   MaxNonlinearIterations: 30
 
+  # Nonlinear solver: "newton" or "picard"
+  Scheme: "picard"
+
 Geometry:
   # Must match examples/tube3d/mesh.py
   WallID: 1
   InletID: 2
   OutletIDs: [3]
+
+Run:
+  Output: "output/tube3d"
+  Element: "P1-P1"
+  Radius: 2.0
+  Length: 30.0
+  Resolution: null          # null uses Radius/4
+  WallResolution: null      # null uses Resolution
+  InletPlateauLambda: 0.15  # inlet profile shape: small gives a plug, large a parabola
+  MaxSteps: null            # null runs the whole waveform
+  StoreAfter: null          # first step written to XDMF; null writes no fields
+  StoreEvery: 10
+  Verbose: true

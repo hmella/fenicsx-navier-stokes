@@ -5,20 +5,24 @@ WHAT THIS CASE IS
 -----------------
 A SimVascular-style vessel segment: blood flowing down a straight cylindrical pipe. The inlet is driven by a prescribed flow waveform, and the outlet is not simply left open but coupled to a lumped (0D) model of everything downstream -- the rest of the arterial tree, represented by a resistance-compliance circuit. That is the RCR Windkessel.
 
-WHY THE WINDKESSEL MATTERS
---------------------------
-If you just let the outlet be traction-free, the pressure there is pinned to zero and the simulation cannot produce physiological pressures at all. Real vessels feel the resistance and elasticity of the vasculature downstream. The Windkessel supplies that: given the flow rate Q leaving the cap, it returns a pressure P that is imposed back on the fluid.
+THE OUTLET MODEL
+----------------
+A traction-free outlet pins the pressure there to zero. The Windkessel replaces it: given the flow rate Q leaving the cap, it returns a pressure P that is imposed back on the fluid as a normal traction.
 
-WHY THIS PARTICULAR SETUP IS A VERIFICATION CASE
-------------------------------------------------
-The shipped tube3d.yaml chooses the circuit parameters so that Rd*C = 1/(4*pi), which matches the sin^2(2*pi*t) waveform in data/inflow/tube.flow. With that pairing the outlet pressure has an exact closed-form solution, so the simulation can be checked against it (tests/benchmarks/test_tube.py does exactly that). Change the parameters or the waveform on their own and the case still runs, but it stops verifying anything.
+VERIFICATION
+------------
+The shipped tube3d.yaml sets Rd*C = 1/(4*pi), matching the sin^2(2*pi*t) waveform in data/inflow/tube.flow. With that pairing the outlet pressure has a closed form, which tests/benchmarks/test_tube.py checks against. Changing the parameters or the waveform on their own leaves a case that runs but verifies nothing.
 
 WHAT IT WRITES
 --------------
-output/tube3d/tube3d.csv, one row per time step, with the flow rates, the Windkessel pressure, the mass balance and the divergence norm; plus XDMF fields if --store-after is given.
+<Run.Output>/tube3d.csv, one row per time step, with the flow rates, the Windkessel pressure, the mass balance and the divergence norm, plus XDMF fields when Run.StoreAfter is set.
+
+CONFIGURATION
+-------------
+Every parameter lives in the YAML file; the only command-line argument is which file to read. The cylinder geometry and mesh resolution are in its Run: section.
 
 Usage:
-    python examples/tube3d/run.py --radius 0.5 --length 5 --resolution 0.1 --max-steps 200
+    python examples/tube3d/run.py --config examples/tube3d/tube3d.yaml
 """
 
 # ruff: noqa: E402
@@ -48,24 +52,25 @@ from fenicsx_navier_stokes import (
     mass_balance,
 )
 
-# Nonlinear solver choice. Picard is the default: it is what the results in this repository were
-# produced with, and it converges from anywhere. Newton converges quadratically once close to the
-# solution, which for a transient problem the previous time step usually provides.
+# Nonlinear solvers selectable through Solver.Scheme in the configuration file
 SOLVERS = {"picard": PicardNSProblem, "newton": NewtonNSProblem}
 
 
-def build(config, radius, length, resolution, wall_resolution=None, element="P1-P1",
-          comm=None, plateau_lam=0.15, solver="picard"):
+def build(config, comm=None):
     """Put together everything the solver needs: mesh, parameters and outlet models."""
     comm = comm if comm is not None else MPI.COMM_WORLD
 
     # Read the YAML configuration. Values are reached with dot notation, so for example pars.Problem.Viscosity is the dynamic viscosity in poise.
     pars = ParameterHandler(config)
+    run = pars.Run
+
+    # Element size at the wall and in the interior. Run.Resolution defaults to a quarter of the radius, and Run.WallResolution to Run.Resolution.
+    resolution = run.Resolution if run.Resolution is not None else run.Radius / 4.0
 
     # Build the cylinder with gmsh. The returned tags label the boundary facets: wall = 1, inlet = 2, outlet = 3. These numbers must agree with tube3d.yaml, or the solver would find no facets to apply boundary conditions to.
-    mesh, cell_tags, facet_tags = tube_mesh.generate(radius=radius, length=length,
+    mesh, cell_tags, facet_tags = tube_mesh.generate(radius=run.Radius, length=run.Length,
                                                      resolution=resolution,
-                                                     wall_resolution=wall_resolution,
+                                                     wall_resolution=run.WallResolution,
                                                      comm=comm)
 
     # The time step is not a free parameter here: it is the spacing between rows of the inflow waveform file, since the solver advances one row per step. The Windkessel ODE is integrated over exactly this interval at every step.
@@ -88,42 +93,25 @@ def build(config, radius, length, resolution, wall_resolution=None, element="P1-
                                       P_out=Constant(mesh, PETSc.ScalarType(wk_cfg.Pd_init))))
 
     # Assemble the Navier-Stokes problem. 'inlet_plateau_lam' shapes the inlet velocity profile: small values give a flat plug, large values a parabola. 0.15 on a radius of a few centimetres is close to a plug, which is what a real vessel inlet looks like.
-    problem = SOLVERS[solver](parameters=pars, mesh=mesh, XDMF=True, domains=cell_tags,
-                              boundaries=facet_tags, windkessels=windkessels,
-                              element=element, inlet_plateau_lam=plateau_lam)
+    problem = SOLVERS[pars.Solver.Scheme](parameters=pars, mesh=mesh,
+                                          XDMF=run.StoreAfter is not None,
+                                          domains=cell_tags, boundaries=facet_tags,
+                                          windkessels=windkessels, element=run.Element,
+                                          inlet_plateau_lam=run.InletPlateauLambda)
     return problem, pars, windkessels
 
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[1])
-    p.add_argument("--config", default=str(Path(__file__).parent / "tube3d.yaml"))
-    p.add_argument("--output", default="output/tube3d")
-    p.add_argument("--radius", type=float, default=2.0, help="cylinder radius")
-    p.add_argument("--length", type=float, default=30.0, help="cylinder length")
-    p.add_argument("--resolution", type=float, default=None, help="element size (default R/4)")
-    p.add_argument("--wall-resolution", type=float, default=None,
-                   help="element size at the wall; set it smaller to resolve a boundary layer")
-    p.add_argument("--element", default="P1-P1", choices=["P1-P1", "P2-P1"])
-    p.add_argument("--plateau-lam", type=float, default=0.15,
-                   help="inlet profile shape: small gives a plug, large a parabola")
-    p.add_argument("--max-steps", type=int, default=None, help="stop early (for a quick check)")
-    p.add_argument("--store-after", type=int, default=None,
-                   help="first step to write to XDMF; omit to write no fields at all")
-    p.add_argument("--store-every", type=int, default=10, help="write every n-th step")
-    p.add_argument("--solver", default="picard", choices=sorted(SOLVERS),
-                   help="nonlinear solver: picard (default, robust) or newton (faster near the solution)")
-    p.add_argument("--quiet", action="store_true")
+    p.add_argument("--config", default=str(Path(__file__).parent / "tube3d.yaml"),
+                   help="parameter file; every setting is read from it")
     args = p.parse_args(argv)
 
     comm = MPI.COMM_WORLD
-    problem, pars, windkessels = build(args.config, args.radius, args.length,
-                                       args.resolution,
-                                       wall_resolution=args.wall_resolution,
-                                       element=args.element,
-                                       plateau_lam=args.plateau_lam, comm=comm,
-                                       solver=args.solver)
+    problem, pars, windkessels = build(args.config, comm=comm)
+    run = pars.Run
 
-    out = Path(args.output)
+    out = Path(run.Output)
     if comm.rank == 0:
         out.mkdir(parents=True, exist_ok=True)
 
@@ -155,9 +143,9 @@ def main(argv=None):
         records.append(row)
 
     # Run the time loop. Every step performs Picard iterations until the velocity and the Windkessel pressures stop changing, then advances to the next waveform row.
-    problem.solve(xdmf_path=str(out / "tube3d.xdmf"), store_after=args.store_after,
-                  store_every=args.store_every, max_steps=args.max_steps,
-                  verbose=not args.quiet, callback=record)
+    problem.solve(xdmf_path=str(out / "tube3d.xdmf"), store_after=run.StoreAfter,
+                  store_every=run.StoreEvery, max_steps=run.MaxSteps,
+                  verbose=run.Verbose, callback=record)
 
     # Write the diagnostics and print a short summary on rank 0
     if comm.rank == 0 and records:

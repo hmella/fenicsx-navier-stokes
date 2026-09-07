@@ -74,7 +74,7 @@ class ParameterHandler:
         return parsed
 
     def __getattr__(self, attr):
-        # Dunder and private lookups are refused explicitly. Delegating them to self.params is what made copy.deepcopy recurse forever: it probes __deepcopy__ on a fresh instance, which lands here before 'params' exists, which looks up 'params', and so on
+        # Dunder and private lookups are refused rather than delegated to self.params, which would recurse: copy.deepcopy probes __deepcopy__ on a fresh instance, before 'params' exists
         if attr.startswith("_") or attr == "params":
             raise AttributeError(attr)
         return getattr(self.params, attr)

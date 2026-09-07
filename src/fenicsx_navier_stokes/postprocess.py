@@ -15,9 +15,9 @@ def _cached_form(u, key, build):
     """
     Returns build() the first time this key is seen for 'u', and the stored result afterwards.
 
-    These helpers are called from the examples' per-step callbacks, and a single aorta step used to construct seven forms: five flow rates through mass_balance, and two for the divergence norm. form() does not recompile -- FFCx caches its generated code on disk -- but it re-hashes the UFL signature and re-imports the module every time, which is milliseconds per call on every step of a twelve-thousand-step run.
+    These helpers run in the examples' per-step callbacks, where a single aorta step constructs seven forms: five flow rates through mass_balance and two for the divergence norm.
 
-    The cache lives on the Function rather than in a module-level dictionary because a compiled form holds a reference to the coefficients it was built from. Keying by id() in a global dictionary would hand back a form bound to a different, already-collected function once an id was reused. Hanging it off 'u' ties the two lifetimes together, which is the same thing Windkessel.flow_rate does with its own _flow_form.
+    The cache lives on the Function itself. A compiled form holds a reference to the coefficients it was built from, so tying the two lifetimes together keeps an id from being reused for a different, already-collected function.
     """
     cache = getattr(u, "_fxns_form_cache", None)
     if cache is None:
@@ -109,7 +109,7 @@ def drag_lift_variational(problem, body_tag):
     dx = problem.dx
     gdim = problem.mesh.geometry.dim
 
-    # Strong residual of the momentum equation. The viscous contribution is omitted because it vanishes elementwise for P1 velocities, matching the stabilization the solver actually assembles
+    # Strong residual of the momentum equation, matching the one the solver assembles. The viscous contribution is omitted; it vanishes elementwise for P1 velocities
     strong = rho / dt * (1.5 * u - 2.0 * u0 + 0.5 * u00) + rho * grad(u) * up
     if problem.f is not None:
         strong = strong - problem.f

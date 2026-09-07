@@ -10,7 +10,7 @@ Time stepping is BDF2. Two treatments of the nonlinearity are available:
 
   PicardNSProblem  linearizes the convection about the previous iterate (an Oseen problem). Converges linearly but from anywhere, including from rest.
 
-  NewtonNSProblem  solves the true nonlinear residual with its exact Jacobian. Converges quadratically but only from a good enough starting guess, which for a transient problem the previous time step supplies.
+  NewtonNSProblem  solves the true nonlinear residual with its exact Jacobian, including the rank-one Windkessel coupling term. Converges quadratically from a good enough starting guess, which for a transient problem the previous time step supplies.
 
 Equal-order P1-P1 pairs are stabilized with SUPG/PSPG plus a grad-div term; P2-P1 is also available and is stabilized identically, the terms being consistent.
 
@@ -60,10 +60,9 @@ from .stabilization import tau_C, tau_M
 # BDF2 coefficient of the new time level, i.e. 3/2
 BDF2_THETA = 1.5
 
-# PETSc log events for the phases that are not themselves PETSc calls. Without them a -log_view
-# profile attributes matrix assembly, the Windkessel update and the user callback to nothing at
-# all, so roughly half the run time is invisible. Registering an event costs nothing and entering
-# one costs a few hundred nanoseconds when logging is off, so they are always on.
+# PETSc log events for the phases that are not themselves PETSc calls, so that a -log_view
+# profile accounts for matrix assembly, the Windkessel update and the user callback. Entering an
+# event costs a few hundred nanoseconds when logging is off.
 _EV_ASSEMBLE_A = PETSc.Log.Event("fxns_assemble_A")
 _EV_ASSEMBLE_B = PETSc.Log.Event("fxns_assemble_b")
 _EV_WINDKESSEL = PETSc.Log.Event("fxns_windkessel")
@@ -71,14 +70,14 @@ _EV_CONVERGENCE = PETSc.Log.Event("fxns_convergence")
 _EV_CALLBACK = PETSc.Log.Event("fxns_callback")
 _EV_IO = PETSc.Log.Event("fxns_io")
 
-# Separates the time loop from one-off setup (mesh reading, the inlet-profile solve, form
-# compilation), which would otherwise inflate every per-step percentage
+# Separates the time loop from one-off setup: mesh reading, the inlet-profile solve and form
+# compilation
 _STAGE_TIME_LOOP = PETSc.Log.Stage("fxns_time_loop")
 
 # The *_star matrices are allocated from the union of the constant and iterate-dependent forms,
-# so the constant block's pattern is a strict SUBSET of theirs. Saying so lets PETSc add them
-# without rebuilding the matrix. It must not be SAME: the constant blocks are allocated from
-# their own form with IGNORE_ZERO_ENTRIES on, so their stored pattern really is smaller.
+# so a constant block's pattern is a strict subset of theirs and MatAXPY can add them without
+# rebuilding. Not SAME: the constant blocks are allocated from their own form with
+# IGNORE_ZERO_ENTRIES on, so their stored pattern is smaller.
 _SUBSET_PATTERN = PETSc.Mat.Structure.SUBSET_NONZERO_PATTERN
 
 
@@ -388,7 +387,7 @@ class BaseProblem:
         # Backflow stabilization strength
         self.beta = Constant(mesh, PETSc.ScalarType(getattr(pars.Problem, "BackflowBeta", 0.0)))
 
-        # Stabilization parameters. tau_M is built on `up`, not on the solution: that keeps it frozen during a Newton iteration, which matters because differentiating sqrt(dot(u,u)) is singular at u = 0 and would produce nan on a cold start
+        # Stabilization parameters. tau_M is built on `up`, not on the solution, so it stays frozen through a Newton iteration; ufl.derivative steps over it rather than differentiating sqrt(dot(u,u)), which is singular at u = 0
         self.tau_M = tau_M(
             self.up, self.dt, self.rho, self.mu, mesh=mesh,
             sigma_BDF=self.sigma_BDF, degree=self.velocity_degree,
@@ -426,7 +425,7 @@ class BaseProblem:
         self.A10_star.assemble()
         self.A10_star.setOption(PETSc.Mat.Option.NEW_NONZERO_LOCATIONS, False)
 
-        # The (1,1) PSPG block. It is allocated here and re-assembled every iteration like the others: tau_M is built on `up`, so this block depends on the iterate too. Treating it as constant leaves it at its tau_M(up = 0) value, which makes the continuity row weight tau_M(up) in its (1,0) part and tau_M(0) here -- no longer one consistent strong residual, so the stabilization stops vanishing on the exact solution. Passing the full bc list is deliberate: both spaces here are the pressure space, so VELOCITY conditions match neither and dolfinx discards them, but a PRESSURE condition in the list is applied, and that is what makes the block non-singular in the fully-Dirichlet case
+        # The (1,1) PSPG block, allocated here and re-assembled every iteration like the others: tau_M is built on `up`, so this block depends on the iterate too, and the continuity row must weight one consistent strong residual across its (1,0) and (1,1) parts. The full bc list is passed: both spaces here are the pressure space, so dolfinx discards the velocity conditions, while a pressure condition in the list is applied and makes the block non-singular in the fully-Dirichlet case
         self.A11_star = create_matrix(form(self.a11_star))
         self.A11_star.setOption(PETSc.Mat.Option.SYMMETRIC, True)
         self.A11_star.setOption(PETSc.Mat.Option.SYMMETRY_ETERNAL, True)
@@ -472,7 +471,7 @@ class BaseProblem:
     # Create and configure solver
     def _setup_solver(self, operator=None):
         """
-        `operator` is the matrix the Krylov method applies. It defaults to the assembled nest; a subclass may pass a different one (a low-rank correction of it, say), in which case the nest is still used as the preconditioner.
+        `operator` is the matrix the Krylov method applies. It defaults to the assembled nest; a subclass may pass a different one, in which case the nest is still used as the preconditioner.
         """
         pars = self.parameters
         self.ksp = PETSc.KSP().create(self.mesh.comm)
@@ -482,10 +481,8 @@ class BaseProblem:
             # Krylov sees the exact operator, the preconditioner keeps the sparse nest
             self.ksp.setOperators(operator, self.A)
 
-        # PETSc's options database is global and persists for the life of the process, so two
-        # problems built in the same session would otherwise read each other's settings --
-        # a direct solver picking up a leftover fieldsplit preconditioner, say. Giving each
-        # instance its own prefix isolates them.
+        # PETSc's options database is global and persists for the life of the process, so each
+        # instance writes under its own prefix
         BaseProblem._ksp_counter += 1
         prefix = f"ns{BaseProblem._ksp_counter}_"
         self._guess_nonzero = False
@@ -504,15 +501,6 @@ class BaseProblem:
         # Two-level linear tolerance, see _linear_rtol
         self._rtol_final = pars.Solver.SolverRTol
         nl_tol = pars.Solver.NonlinearTolerance
-
-        # picard (default) iterates the convection to convergence; extrapolated does one
-        # linear solve per step, see PicardNSProblem._extrapolated_step
-        self._nonlinear_scheme = getattr(pars.Solver, "NonlinearScheme", "picard")
-        if self._nonlinear_scheme not in ("picard", "extrapolated"):
-            raise ValueError(
-                f"unknown Solver.NonlinearScheme {self._nonlinear_scheme!r}; "
-                "expected 'picard' or 'extrapolated'"
-            )
         self._rtol_first = float(
             getattr(pars.Solver, "SolverRTolFirst", max(self._rtol_final, 0.1 * nl_tol))
         )
@@ -531,14 +519,9 @@ class BaseProblem:
             opts["ksp_gmres_restart"] = pars.Solver.SolverGMRESRestart
             opts["ksp_pc_side"] = "right"
 
-            # Start each solve from the current contents of the solution vector rather than
-            # from zero. In the Picard iteration that vector already holds the previous
-            # iterate, and on the first iteration of a step it holds the converged previous
-            # time step, which is only O(dt) away. Measured on the aorta: 20 Krylov
-            # iterations per solve down to 15.
-            #
-            # The Newton path turns this off again, because it solves for a correction and
-            # the previous correction is a poor guess for the next one.
+            # Start each solve from the current contents of the solution vector: the previous
+            # Picard iterate, or on the first iteration of a step the converged previous time
+            # level. The Newton path turns this off again, since it solves for a correction.
             self.ksp.setInitialGuessNonzero(True)
             self._guess_nonzero = True
 
@@ -551,33 +534,17 @@ class BaseProblem:
                 pars.Solver, "SchurFactType", "lower"
             )
 
-            # `selfp` builds A11 - A10 diag(A00)^-1 A01. Its stencil is roughly the square of
-            # the P1 vertex one, so it costs a sparse triple product per preconditioner setup
-            # and gives AMG a denser matrix to work on -- which is the likeliest reason the
-            # pressure block costs five times the velocity block despite having a third of the
-            # dofs.
-            #
-            # Using the (1,1) block directly is tempting, because PSPG puts a tau_M-weighted
-            # pressure Laplacian there and Cahouet-Chabard says that is the right operator at
-            # this operating point. It does not work: that block is a pure-Neumann Laplacian,
-            # singular on constants, where selfp's approximation is not, and the cold start
-            # diverges outright (KSP_DIVERGED_DTOL on the very first solve). Measured, not
-            # assumed. A non-singular variant would have to shift it by a pressure mass
-            # matrix; until someone does that, selfp stays.
+            # `selfp` approximates the Schur complement by A11 - A10 diag(A00)^-1 A01. The
+            # (1,1) block on its own is not usable here: PSPG makes it a pure-Neumann
+            # Laplacian, singular on constants, and the cold start diverges with
+            # KSP_DIVERGED_DTOL on the first solve.
             opts["pc_fieldsplit_schur_precondition"] = getattr(
                 pars.Solver, "SchurPrecondition", "selfp"
             )
 
-            # BoomerAMG settings for 3D. PETSc's default strong_threshold is 0.25, which is
-            # the two-dimensional value: on tetrahedra it coarsens far too slowly, giving
-            # dense hierarchies whose setup and V-cycle both cost several times what they
-            # need to. HMIS with ext+i interpolation and one level of aggressive coarsening
-            # is the standard three-dimensional recipe.
-            #
-            # Measured on the aorta at 8 ranks: 12.1 s/step down to 9.0 s/step with the
-            # Krylov iteration count unchanged at 19-21. Sweeping strong_threshold over
-            # {0.5, 0.6, 0.7} and adding interpolation truncation all landed within 2%, so
-            # this is a plateau rather than a tuned edge.
+            # BoomerAMG settings for tetrahedra: HMIS coarsening, ext+i interpolation and one
+            # level of aggressive coarsening, with a strong threshold of 0.5. PETSc's default
+            # threshold of 0.25 is the two-dimensional value.
             amg = {
                 "strong_threshold": getattr(pars.Solver, "AMGStrongThreshold", 0.5),
                 "coarsen_type": getattr(pars.Solver, "AMGCoarsenType", "HMIS"),
@@ -615,14 +582,14 @@ class BaseProblem:
         # Apply options and set up solver
         self.ksp.setFromOptions()
 
-    # Whether this solve rebuilds the preconditioner or reuses the previous one
+    # Decide whether this solve rebuilds the preconditioner or reuses the previous one
     def _prepare_preconditioner(self, first_of_step):
         """
-        Reusing a preconditioner cannot change the answer. FGMRES applies the true, current operator in every matrix-vector product; the preconditioner only steers the search, so a stale one costs Krylov iterations and nothing else. That makes this the cheapest saving available, since the two BoomerAMG hierarchies are otherwise rebuilt on every nonlinear iteration and account for about an eighth of the run.
+        FGMRES applies the true, current operator in every matrix-vector product and the preconditioner only steers the search, so reuse changes the Krylov iteration count and nothing else.
 
-        Two tiers. Within a time step the operator changes only through `up`, whose relative change is below the nonlinear tolerance by construction, so iterations after the first reuse unconditionally. Across time steps the operator drifts by O(dt) per step, so a rebuild is forced every `PreconditionerRefresh` steps, or sooner if the Krylov count has grown by more than a factor `PreconditionerGuard` since the last rebuild.
+        Two tiers. Within a time step, iterations after the first reuse unconditionally. Across time steps a rebuild is forced every `PreconditionerRefresh` steps, or sooner once the Krylov count has grown by more than a factor `PreconditionerGuard` since the last rebuild.
 
-        The guard is safe in parallel: KSPGetIterationNumber is collective and returns the same value on every rank, so every rank reaches the same decision. A rank-dependent one would deadlock at the next collective.
+        KSPGetIterationNumber is collective and returns the same value on every rank, so the guard reaches the same decision everywhere.
         """
         if not self._is_iterative or self._pc_period <= 0:
             return
@@ -642,7 +609,7 @@ class BaseProblem:
     # Record what the last solve cost, for the reuse guard
     def _record_linear_iterations(self, its):
         if self._pc_rebuilt_this_solve:
-            # The healthy cost is measured against a fresh preconditioner, not a stale one
+            # The reference count is the one a fresh preconditioner achieves
             self._pc_its_at_rebuild = its
             self._pc_rebuilt_this_solve = False
         self._pc_last_its = its
@@ -650,9 +617,7 @@ class BaseProblem:
     # Relative tolerance for this nonlinear iteration
     def _linear_rtol(self, it):
         """
-        The first nonlinear iteration is a throwaway: its only job is to supply the linearization point and tau_M for the next one, and it differs from that next iterate by O(1) relative. Solving it as tightly as the accepted iterate is wasted work, so it gets a looser tolerance -- by default a tenth of the nonlinear tolerance, which keeps it well inside the accuracy the step is aiming for, and never looser than the final tolerance.
-
-        The accepted iterate keeps the full tolerance. That matters more than it looks: nothing checks a residual afterwards, so the linear-solve error enters u_h, then the previous time levels, and accumulates over the run.
+        The first nonlinear iteration supplies the linearization point and tau_M for the next one and gets a looser tolerance: by default a tenth of the nonlinear tolerance, and never looser than the final one. Every iteration after it uses the full tolerance.
         """
         return self._rtol_first if it == 0 else self._rtol_final
 
@@ -798,9 +763,8 @@ class PicardNSProblem(BaseProblem):
 
     # The Oseen (Picard) forms.
     #
-    # Lives here rather than inline in set_problem because NewtonNSProblem needs it too: it
-    # runs a Picard step on the first time level, where there is no previous solution to
-    # start Newton from, and again whenever a Newton step fails to converge.
+    # Shared with NewtonNSProblem, which runs a Picard step on the first time level and again
+    # whenever a Newton step fails to converge.
     def _build_oseen_forms(self):
         """
         Sets self.a, self.L and the four a**_star forms, and returns the constant Galerkin blocks (a00, a01, a10) for the matrix allocation.
@@ -819,10 +783,8 @@ class PicardNSProblem(BaseProblem):
         # Variational formulation (Galerkin part)
         # ---------------------------------------------------------------------------------
         a00_conv = rho * inner(grad(u) * self.up, v) * dx
-        # The grad-div term joins the mass and viscous terms in the constant block: tau_C is
-        # 0.4*mu/rho, a product of two Constants with no dependence on the iterate or on the
-        # element size, so re-assembling it on every nonlinear iteration only ever reproduced
-        # the same numbers. The assembled system is unchanged.
+        # The grad-div term sits with the mass and viscous terms in the constant block: tau_C
+        # is 0.4*mu/rho, with no dependence on the iterate or on the element size
         a00 = (rho / dt * inner(BDF2_THETA * u, v) * dx
                + 2 * mu * inner(eps(u), eps(v)) * dx
                + tC * rho * div(u) * div(v) * dx)
@@ -848,14 +810,13 @@ class PicardNSProblem(BaseProblem):
         # ---------------------------------------------------------------------------------
         # SUPG/PSPG stabilization
         # ---------------------------------------------------------------------------------
-        # The two halves of the strong momentum residual: the terms in the unknown u, and the known data at the previous time levels. Both carry a SINGLE factor of rho -- they are two halves of the same residual, and a mismatch makes the stabilization inconsistent, i.e. it no longer vanishes on the exact solution. An earlier revision squared rho on the implicit half only, which is invisible at rho = 1 but not at the rho = 1.06 of the physical cases. The viscous part is omitted because it vanishes elementwise for P1 velocities
+        # The two halves of the strong momentum residual: the terms in the unknown u, and the known data at the previous time levels. Both carry a SINGLE factor of rho, so that together they form one residual that vanishes on the exact solution. The viscous part is omitted; it vanishes elementwise for P1 velocities
         res_lhs = rho * (BDF2_THETA / dt * u + grad(u) * self.up)
         res_rhs = rho / dt * (2.0 * self.u0 - 0.5 * self.u00)
         if self.f is not None:
             res_rhs = res_rhs + self.f
 
-        # Momentum row: streamline weight (up.grad)v against the residual. The grad-div term
-        # that used to live here is now in a00, since it does not depend on the iterate
+        # Momentum row: streamline weight (up.grad)v against the residual
         a_SUPG_00 = tM * inner(grad(v) * self.up, res_lhs) * dx
         if self.supg_viscous:
             a_SUPG_00 += tM * mu * inner(nabla_grad(grad(v) * self.up), nabla_grad(u)) * dx
@@ -887,9 +848,8 @@ class PicardNSProblem(BaseProblem):
         self._f_a10_star = form(self.a10_star)
         self._f_a11_star = form(self.a11_star)
 
-        # Per-block boundary-condition lists. dolfinx wants the conditions grouped by function
-        # space, and that grouping depends only on the forms, so it is done once here rather
-        # than twice on every nonlinear iteration.
+        # Per-block boundary-condition lists, grouped by function space once here rather than
+        # on every nonlinear iteration
         self._bcs_lift = bcs_by_block(extract_function_spaces(self.a), self.bcs)
         self._bcs_set = bcs_by_block(extract_function_spaces(self.L), self.bcs)
 
@@ -984,15 +944,13 @@ class PicardNSProblem(BaseProblem):
                 # Relative L2 error between successive Picard iterates
                 nl_error = self._relative_velocity_change(self.up)
 
-                # Windkessel convergence measure
+                # Mismatch between the 0D and 3D models at the outlets, measured against the
+                # traction that was imposed; see Windkessel.coupling_residual
                 if self.windkessels is not None:
-                    wk_error = max(w.residual() for w in self.windkessels)
+                    wk_error = max(w.coupling_residual(self.u_h) for w in self.windkessels)
 
             # Update the iterate
             self.up.x.array[:] = self.u_h.x.array
-            if self.windkessels is not None:
-                for wksl in self.windkessels:
-                    wksl.Pd_nl_prev = wksl.Pd_nl
 
             if verbose and rank == 0:
                 print(f"      Nonlinear error: {nl_error:.2e}"
@@ -1017,22 +975,7 @@ class PicardNSProblem(BaseProblem):
             "ksp_reason": int(reason),
         }
 
-    # One linear solve per step, with the convection extrapolated instead of iterated
-    def _extrapolated_step(self, n_time, verbose=True):
-        """
-        Linearizes the convection about `2 u^n - u^{n-1}` and solves once, with no nonlinear iteration at all.
-
-        This is not "stop the Picard iteration after one sweep". That sweep linearizes about `u^n`, a first-order extrapolation, which would drop the whole scheme to O(dt) in the convective term. `2 u^n - u^{n-1}` is second-order and therefore consistent with the BDF2 time derivative, and the resulting scheme is a standard semi-implicit one.
-
-        On the aorta as configured, 990 of the 1000 steps of a cardiac cycle take exactly two Picard iterations, so removing the iteration is worth close to a factor of two. What it costs is the fixed point: the convection and the stabilization are evaluated at an extrapolated velocity rather than at the solution, so this is a different discretization, not a cheaper route to the same one. It stays off by default for that reason.
-
-        `tau_M`, the SUPG weight and the backflow term all read `up`, so setting `up` once here keeps every one of them on the same extrapolated field. Splitting that -- freezing some terms and not others -- is what made the PSPG block inconsistent once before.
-
-        The Windkessel coupling becomes fully lagged, driven by the extrapolated flow rate. That matches what the coupling already is: it is first order in dt regardless, because the flow rate is frozen across the step.
-        """
-        rank = self.mesh.comm.rank
-
-        # Second-order extrapolation of the velocity to the new time level
+    # Second-order extrapolation of the velocity to the new time level
         self.up.x.array[:] = 2.0 * self.u0.x.array - self.u00.x.array
         self.up.x.scatter_forward()
 
@@ -1084,6 +1027,20 @@ class PicardNSProblem(BaseProblem):
             "ksp_reason": int(reason),
         }
 
+    # Second-order extrapolation of the velocity to the new time level
+    def _extrapolate_iterate(self, n_time):
+        """
+        Sets the starting iterate to `2 u^n - u^{n-1}`, a second-order extrapolation consistent with the BDF2 time derivative. This fixes only where the iteration starts, not the fixed point it converges to, so it changes the number of sweeps a step takes and nothing else.
+
+        `nl_error` is the relative change from `up` to the solution, so the first sweep now reports the extrapolation error. Every term that reads `up` -- tau_M, the SUPG weight, the backflow traction -- sees the same field.
+
+        At the first step the two history levels hold the same initial condition and the extrapolation reduces to `u^n`.
+        """
+        if n_time == 0:
+            return
+        self.up.x.array[:] = 2.0 * self.u0.x.array - self.u00.x.array
+        self.up.x.scatter_forward()
+
     # Advance one time step by Picard-iterating to convergence
     def step(self, n_time, t, verbose=True, pre_step=None):
         """
@@ -1093,14 +1050,8 @@ class PicardNSProblem(BaseProblem):
             pre_step(self, n_time, t)
 
         self._update_inlet(n_time, t)
-
-        # The extrapolation needs two distinct previous levels. At the first step u^n and
-        # u^{n-1} are the same initial condition, so it degenerates to u^n and there is
-        # nothing to gain; Picard also handles the cold start, which is where it is needed.
-        if self._nonlinear_scheme == "extrapolated" and n_time > 0:
-            info = self._extrapolated_step(n_time, verbose=verbose)
-        else:
-            info = self._oseen_step(n_time, verbose=verbose)
+        self._extrapolate_iterate(n_time)
+        info = self._oseen_step(n_time, verbose=verbose)
         self._advance_time_levels()
         return info
 
@@ -1334,7 +1285,7 @@ class NewtonNSProblem(PicardNSProblem):
         """
         Returns the right-hand side for `J dx = b`, from which the update is `u -= dx`.
 
-        The boundary conditions are applied in increment form: `set_bc` with `x0` and `alpha=-1` puts `u_h - g` in the constrained entries, so the correction drives the solution onto the Dirichlet data. That handles the inhomogeneous inlet profile and the pressure pin identically, with no separate homogeneous conditions needed.
+        The boundary conditions are applied in increment form: `set_bc` with `x0` and `alpha=-1` puts `u_h - g` in the constrained entries, so the correction drives the solution onto the Dirichlet data. The inhomogeneous inlet profile and the pressure pin are handled the same way, with no separate homogeneous conditions.
         """
         # self.x is the nest wrapping u_h and p_h, i.e. the current iterate. The lifting
         # and boundary helpers take the nest itself and split it internally.
@@ -1400,10 +1351,8 @@ class NewtonNSProblem(PicardNSProblem):
             operator = self._newton_operator if self._newton_operator is not None else self.A
             self.ksp.setOperators(operator, self.A)
 
-            # Newton solves for a correction, so zero is the right starting point: the
-            # previous correction is larger than this one and points the wrong way. The
-            # iterative path enables a nonzero guess for the Picard iteration, which does
-            # solve for the solution itself, so it has to be switched off again here.
+            # Newton solves for a correction, so the guess is zero. The iterative path
+            # enables a nonzero guess for the Picard iteration and it is switched off here.
             self.ksp.setInitialGuessNonzero(False)
             self._prepare_preconditioner(first_of_step=(it == 0))
             self.ksp.solve(b, self.dx_vec)
@@ -1431,9 +1380,7 @@ class NewtonNSProblem(PicardNSProblem):
                 nl_error = self._relative_velocity_change(self.up)
 
                 if self.windkessels is not None:
-                    wk_error = max(w.residual() for w in self.windkessels)
-                    for wksl in self.windkessels:
-                        wksl.Pd_nl_prev = wksl.Pd_nl
+                    wk_error = max(w.coupling_residual(self.u_h) for w in self.windkessels)
 
             if verbose and rank == 0:
                 print(f"      Nonlinear error: {nl_error:.2e}  residual: {res_norm:.2e}", flush=True)

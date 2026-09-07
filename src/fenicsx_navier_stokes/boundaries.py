@@ -273,7 +273,7 @@ def inlet_lap_paraboloid(V, ft=None, cap_id="everywhere", wall_id="everywhere", 
         a = inner(grad(u), grad(v)) * dx
     L = one * v * dx
 
-    # No slip on the wall; the cap itself carries a natural (zero Neumann) condition, which is why on a cylinder the solution is independent of the axial coordinate
+    # No slip on the wall; the cap itself carries a natural (zero Neumann) condition, so on a cylinder the solution is independent of the axial coordinate
     zero = Constant(Q.mesh, PETSc.ScalarType(0))
     wall_dofs = locate_dofs_topological(Q, Q.mesh.topology.dim - 1, ft.find(wall_id))
     bc_wall = dirichletbc(zero, wall_dofs, Q)
@@ -388,7 +388,11 @@ class Windkessel:
         self.P_out = P_out
         self.Pd_nl = Pd_prev  # distal pressure at the current nonlinear iterate
         self.Pd_nl_prev = Pd_prev  # ... and at the previous one, used by residual()
-        self._flow_form = None
+        # The outlet pressure last written into P_out, i.e. the one the momentum equation was
+        # solved against; coupling_residual() measures against it
+        self.P_out_imposed = Rp * Q_out + Pd_prev
+        # Compiled flux forms, one per function they were built for; see flow_rate
+        self._flow_forms = {}
 
     def ODE(self, t, Pd):
         """
@@ -400,52 +404,75 @@ class Windkessel:
         """
         Advance the distal pressure across 't_range' with classical RK4 and return P_out = Rp*Q + Pd. 'h' is ignored; the sub-step follows from Niter.
 
-        Evaluated in closed form rather than by stepping. The flow rate is frozen across the interval, so the equation is the linear, autonomous `y' = -lambda*(y - y_inf)` with `lambda = 1/(Rd*C)` and `y_inf = Rd*Q`, and RK4 applied to it is exactly the affine map
+        The flow rate is frozen across the interval, so the equation is the linear, autonomous `y' = -lambda*(y - y_inf)` with `lambda = 1/(Rd*C)` and `y_inf = Rd*Q`. RK4 applied to it is the affine map
 
             y <- y_inf + A*(y - y_inf),   A = 1 - z + z^2/2 - z^3/6 + z^4/24,   z = lambda*step
 
-        where A is RK4's stability polynomial. n sub-steps therefore multiply the offset by A^n, and the whole integration is one expression. This is the same result the loop produced, not an approximation to it: it agrees with the old sub-stepping loop to 2e-15 relative over the parameter range the tests cover, including the deliberately coarse (Niter=4, dt=0.3) case. The fourth-order truncation error in Niter is reproduced exactly, since it is a property of A, so the substep-convergence tests are unaffected.
-
-        With Niter = 1000 and four outlets the loop ran 16000 Python-level ODE evaluations on every nonlinear iteration of every time step. Letting n go to infinity turns A^n into exp(-dt/(Rd*C)), which is what NewtonNSProblem._outlet_impedance differentiates.
+        with A the RK4 stability polynomial, so n sub-steps multiply the offset by A^n and the integration is evaluated in closed form. The result matches sub-stepping to 2e-15 relative, including at Niter = 4, and carries the same fourth-order truncation error in Niter.
         """
-        t_min, t_max = t_range[0], t_range[1]
-        n = int(self.Niter)
-        step = (t_max - t_min) / n
+        self.Pd_nl = self._distal_pressure(self.Q_out, t_range[1] - t_range[0])
+        return self.Rp * self.Q_out + self.Pd_nl
 
-        # RK4's stability polynomial, minus one. Written by Horner in z rather than as A - 1 so
-        # that no significance is lost when z is tiny, which it is whenever Niter is large
+    # The closed-form map, with no side effects
+    def _distal_pressure(self, Q, span):
+        """
+        Distal pressure after integrating across 'span' with the flow rate held at 'Q', starting from the accepted previous time level Pd_prev. Leaves the model's state untouched.
+        """
+        n = int(self.Niter)
+        step = span / n
+
+        # RK4's stability polynomial minus one, by Horner in z so that no significance is lost
+        # when z is tiny
         z = step / (self.Rd * self.C)
         Am1 = z * (-1.0 + z * (0.5 + z * (-1.0 / 6.0 + z / 24.0)))
 
-        # A**n - 1, again without cancellation. The branch covers the case where the sub-step
-        # is large enough that RK4 is unstable and A has left (0, 1]; the closed form still
-        # reproduces what the loop would have done, divergence included
+        # A**n - 1, again without cancellation. The branch covers A outside (0, 1], which is
+        # where the sub-step is large enough for RK4 to be unstable
         A = 1.0 + Am1
         powm1 = np.expm1(n * np.log1p(Am1)) if A > 0.0 else A**n - 1.0
 
         # y_n = y_inf + A^n (y_0 - y_inf), rearranged so the update is added to Pd_prev
-        self.Pd_nl = float(self.Pd_prev + powm1 * (self.Pd_prev - self.Rd * self.Q_out))
-        return self.Rp * self.Q_out + self.Pd_nl
+        return float(self.Pd_prev + powm1 * (self.Pd_prev - self.Rd * Q))
 
     def flow_rate(self, u):
         """
         Flow rate through the cap. Positive means flow leaving the domain, since n is the outward normal.
+
+        A compiled form is bound to the coefficients it was built from, so the cache is keyed on 'u'; the function is stored alongside its form so an id cannot be reused while the entry is live. In practice the dictionary holds at most two entries per outlet, the iterate and the solution.
         """
         mesh = u.function_space.mesh
-        if self._flow_form is None:
+        entry = self._flow_forms.get(id(u))
+        if entry is None or entry[0] is not u:
             ds = Measure("ds", domain=mesh, subdomain_data=self.facet_tags)
             n = FacetNormal(mesh)
-            self._flow_form = form(dot(u, n) * ds(self.cap_id))
-        return mesh.comm.allreduce(assemble_scalar(self._flow_form), op=MPI.SUM)
+            entry = (u, form(dot(u, n) * ds(self.cap_id)))
+            self._flow_forms[id(u)] = entry
+        return mesh.comm.allreduce(assemble_scalar(entry[1]), op=MPI.SUM)
 
     def residual(self):
         """
         Relative change of the distal pressure between nonlinear iterates,
         |Pd_nl - Pd_nl_prev| / (P_ATOL + |Pd_nl|).
 
-        The absolute floor is deliberate. A purely relative measure divides by Pd_nl, which is exactly zero on the first iteration of the first step whenever the initial velocity and Pd_init both vanish -- the default for the aorta cases. That gives nan, and since nan > tol is False the Windkessel term drops out of the convergence test silently.
+        The absolute floor keeps the result finite when Pd_nl is exactly zero, which it is on the first iteration of the first step whenever the initial velocity and Pd_init both vanish.
         """
         return abs(self.Pd_nl - self.Pd_nl_prev) / (self.P_ATOL + abs(self.Pd_nl))
+
+    def coupling_residual(self, u):
+        """
+        Mismatch between the 0D and 3D models at the outlet, given the velocity 'u'.
+
+        The momentum equation was solved against the fixed traction P_out_imposed, computed from the flow rate of the previous iterate. Feeding 'u' back through the outlet model gives the pressure it implies; the two are equal at the fixed point of the coupled system, so
+
+            |Rp*Q(u) + Pd(Q(u)) - P_out_imposed| / (P_ATOL + |Rp*Q(u) + Pd(Q(u))|)
+
+        is zero only there. This is the measure the solver's convergence test uses; residual() reports the change between successive impositions instead.
+
+        The absolute floor keeps the result finite at a cold start with Pd_init = 0 and zero flow.
+        """
+        q = self.flow_rate(u)
+        p_implied = self.Rp * q + self._distal_pressure(q, self.dt_sim)
+        return abs(p_implied - self.P_out_imposed) / (self.P_ATOL + abs(p_implied))
 
     def advance(self):
         """
@@ -462,6 +489,7 @@ class Windkessel:
         self.Q_out = self.flow_rate(u)
         p_out = self.RK4([0.0, self.dt_sim])
         self.P_out.value = p_out
+        self.P_out_imposed = p_out
         if verbose and mesh.comm.rank == 0:
             print(
                 f"    [Windkessel] Pressure on cap {self.cap_id:d}: {p_out:.2e}",
@@ -478,7 +506,7 @@ def pressure_pin_bc(Q, value=0.0, point=None):
     """
     Fix the hydrostatic constant by constraining one pressure dof.
 
-    Needed only when the velocity is prescribed on the whole boundary, since the pressure is then determined up to a constant. A traction boundary (an outflow, or a Windkessel) removes the nullspace, which is why the physical cases do not need this.
+    Needed only when the velocity is prescribed on the whole boundary, where the pressure is determined up to a constant. A traction boundary -- an outflow, or a Windkessel -- removes that nullspace, so the physical cases do not use this.
 
     The dof closest to 'point' (default: the origin corner) is chosen, deterministically, so that the result does not depend on the partitioning.
     """

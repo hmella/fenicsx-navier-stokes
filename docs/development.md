@@ -60,6 +60,7 @@ Always pass `-u "$(id -u):$(id -g)"`. Without it the container runs as root and 
 - `tau_M` viscous term used `Ck*mu²/h⁴` (dimensionally wrong) → `Ck*(mu/(rho*h²))²`.
 - Windkessel residual divided by `Pd`, which is exactly 0 at cold start → `nan`, and `nan > tol` is False, silently dropping the criterion. Now `|ΔPd|/(P_ATOL + |Pd|)`.
 - `Windkessel.RK4` used `arange(0, dt+h, h)`, overshooting to `dt+h` for many `(dt, Niter)` pairs (~9e-5 relative error at `dt=0.3, Niter=1000`).
+- **`Windkessel.flow_rate` compiled its form once and then ignored its argument.** A compiled form is bound to the coefficients it was built from, so reusing one form for a different function silently returns the first function's flux. Latent until `coupling_residual` began asking for the flux of the solution after `update` had bound the form to the iterate: the residual then came out identically zero and the Windkessel term dropped out of the convergence test without failing. Cache is now keyed on the function.
 - `BackflowStab` class was unusable (4 independent bugs) → pure-UFL `backflow_stab()`.
 - `ParameterHandler.__getattr__` recursed on `deepcopy`.
 - `PowerLaw` defaulted to `n=0` (i.e. `mu = m/gamma`, not Newtonian) → `n=1`.
@@ -73,7 +74,9 @@ Always pass `-u "$(id -u):$(id -g)"`. Without it the container runs as root and 
 ## Measured results (regenerate with `make test-slow`)
 
 - Newton's Jacobian against finite differences: relative error falls linearly with the step, 4.007e-05 → 4.023e-09, then round-off. That linear scaling is the proof it is exact.
-- **Picard is faster than Newton on the aorta as configured.** 250 steps through systole, 8 ranks each: Picard 523 iterations / 2522 s, Newton 516 / 3289 s. Both converge in **2 iterations** on 240 of 250 steps, so Newton saves 1.3% of iterations while costing 32% more per iteration (6.37 s against 4.82 s). The cause is `NonlinearTolerance: 1.0e-2` with `dt = 8e-4`: there is almost no nonlinear work to save. Newton wins during the start-up transient from rest (steps 1-4: 3,3,3 against 7,5,4) and on genuinely harder problems -- 29% faster on a 2D 60x60 case at `Re ~ 1000`. Do not generalise from a short run near `t = 0`; a four-step measurement suggested Newton was 37% faster and that was an artefact of the transient.
+- **Newton is faster than Picard on the aorta, and is the default there.** 40 steps at 8 ranks: Newton 5.12 s/step against Picard 7.48. Newton carries the exact rank-one Windkessel term `Z_k a_k a_k^T`, and once the convergence test measures the real 0D/3D coupling residual that term earns its keep.
+
+  This reverses an earlier measurement recorded here, and the reason it was wrong is worth keeping. Under the old convergence test both schemes were pinned at exactly two sweeps a step -- the test could not pass on the first sweep and the coupling error it reported was already below tolerance on the second -- so Newton had nothing to accelerate and lost on its 32% higher per-iteration cost. The old numbers (250 systolic steps: Picard 523 iterations / 2522 s, Newton 516 / 3289 s) were correct measurements of a comparison that the stopping test had rendered meaningless. Newton also wins on genuinely harder problems: 29% faster on a 2D 60x60 case at `Re ~ 1000`.
 - MMS at `rho=1.06`, 8/16/32 crossed: L²(u) rate **2.00**, H¹(u) **1.06**, L²(p) 3.08 (pre-asymptotic). P2-P1: 3 and 2.
 - Inlet profile vs modified-Bessel shape factor: error ≤0.011 for `beta ≤ 13.3` on a 90k-cell graded cylinder; `beta = 40` needs ~290k cells.
 - Aorta 11 mm (643k tets, iterative solver): ~113 s/step serial before the performance work; see the Performance section for the current parallel numbers.
@@ -116,6 +119,27 @@ That middle row splits the credit: everything other than the AMG settings and pr
 
 - **`pc_fieldsplit_schur_precondition a11`.** Tempting, because PSPG puts a `tau_M`-weighted pressure Laplacian in the (1,1) block and Cahouet–Chabard says that is the right Schur preconditioner at this operating point (`rho*1.5/dt ~ 2000` against a viscous `mu/h^2 ~ 16`). It diverges on the first solve (`KSP_DIVERGED_DTOL`): that block is a pure-Neumann Laplacian, singular on constants, where `selfp`'s approximation is not. A non-singular variant would shift it by a pressure mass matrix.
 - **A Cauchy-in-`dt` study of the temporal order.** Invalid for this scheme: `tau_M` contains `(sigma/dt)^2`, and the transient term accounts for 99.7% of it at the settings tested, so `tau_M` is proportional to `dt` and refining the time step changes the *spatial* stabilization too. Run on the Picard scheme, which should show a clean BDF2 rate, it measures 0.72.
+
+### The nonlinear convergence test measures a residual, not a change
+
+Both halves of the criterion used to be posed on the change between successive iterates, and that made them unable to pass on a first sweep no matter how good the solution already was.
+
+`nl_error` is `||up - u_h|| / ||u_h||`. With `up` seeded from `u^n` the first sweep reports how far the flow moved in one time step -- around 6e-2 on the aorta against a 1e-2 tolerance. `PicardNSProblem._extrapolate_iterate` now seeds it with `2u^n - u^{n-1}` instead, which makes that first number the actual extrapolation error: measured 1.6e-3, so the velocity half of the test passes on the first sweep. This changes only where the iteration starts, never the fixed point it converges to.
+
+`wk_error` was `|Pd_nl - Pd_nl_prev|`, the difference between two successive *impositions* of the outlet pressure. `Windkessel.coupling_residual` replaces it with the mismatch between the traction that was imposed and the pressure the returned velocity implies, which is zero only at the fixed point of the coupled system.
+
+**That reveals the old test was optimistic.** The old measure never saw the `Rp*Q` term, which responds instantly to velocity with none of the RCR's damping, so it was blind to the fast half of the coupling. Measured per sweep in steady state:
+
+| sweep | `nl_error` | `wk_error` (true residual) |
+|---|---|---|
+| 0 | 1.63e-3 | 3.36e-2 |
+| 1 | 1.81e-3 | 3.97e-2 (rises) |
+| 2 | 1.17e-3 | 1.18e-2 |
+| 3 | 5.84e-4 | 6.50e-3 |
+
+Four sweeps to reach 1e-2, where the old proxy stopped at two. **Aorta results produced before this change were converged to roughly 1-4% in the coupling, not the 1% their configuration asked for.** The honest test costs 1.7x with Newton (5.12 s/step against 3.04), which is the price of the tolerance meaning what it says.
+
+The coupling residual contracts at only 0.3-0.55 and is not monotonic, so Aitken relaxation on the outlet pressure is the obvious next lever if this cost matters. It looked pointless while the proxy criterion was hiding the iteration it would accelerate.
 
 ### Tolerances: check which one is binding
 

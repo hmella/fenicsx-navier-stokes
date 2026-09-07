@@ -51,7 +51,7 @@ class PowerLaw:
 
     n = 1 recovers a Newtonian fluid with mu = m, n < 1 is shear thinning (blood-like) and n > 1 shear thickening. The result is clipped to [m/clamp_ratio, m*clamp_ratio]: this is not cosmetic, since for n < 1 the shear rate vanishes wherever the velocity is locally constant and the formula returns +inf.
 
-    Note the default n = 1.0. An earlier revision defaulted to n = 0.0, which silently gives mu = m/gamma, i.e. neither Newtonian nor a sensible default.
+    The default n = 1.0 is the Newtonian case, mu = m.
     """
 
     def __init__(self, u, m=0.04, n=1.0, clamp_ratio=1.0e4):
